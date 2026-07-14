@@ -207,6 +207,24 @@ def convert_texture_to_png_if_bmp(src_path: str) -> str:
     return src_path
 
 
+def read_texture_bytes(abs_path: Optional[str]) -> Optional[bytes]:
+    """Read the raw bytes of a texture file for embedding into FBX binary.
+
+    Args:
+      abs_path: absolute path to the texture file (from resolve_texture_path).
+
+    Returns:
+      The file bytes, or None if the path is None or the file cannot be read.
+    """
+    if not abs_path:
+        return None
+    try:
+        with open(abs_path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
 def find_all_textures(
     pmx_path: str,
     texture_table: List[str],

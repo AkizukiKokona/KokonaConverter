@@ -1,10 +1,12 @@
 """PMX -> FBX conversion orchestrator.
 
-Reads a PMX file, resolves/copies textures, and writes an FBX 7.4.0 ASCII
-file via the fbx_writer module. Also writes a small sidecar JSON describing
-data that cannot be represented in FBX (IK chains, rigid bodies, joints,
-display frames, non-vertex morphs, SDEF parameters) so the user can inspect
-what was preserved and what was dropped.
+Reads a PMX file, resolves/copies textures, and writes an FBX 7.4.0 binary
+file via the fbx_writer module. Textures are embedded into the FBX binary
+(Video.Content) so UE4 imports them automatically without external files.
+Also writes a small sidecar JSON describing data that cannot be represented
+in FBX (IK chains, rigid bodies, joints, display frames, non-vertex morphs,
+SDEF parameters) so the user can inspect what was preserved and what was
+dropped.
 """
 
 from __future__ import annotations
@@ -12,11 +14,11 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from fbx_writer import ConversionOptions, write_fbx
 from pmx_reader import PMXModel, read_pmx
-from texture_utils import copy_texture, find_all_textures, resolve_texture_path
+from texture_utils import copy_texture, find_all_textures, read_texture_bytes, resolve_texture_path
 
 
 def convert_pmx_to_fbx(
@@ -69,6 +71,20 @@ def convert_pmx_to_fbx(
 
     resolved = find_all_textures(pmx_path, model.textures, material_refs, log=log)
 
+    # Read texture bytes for embedding into the FBX binary. This is independent
+    # of copy_textures: even if we also copy files next to the FBX, the
+    # embedded bytes ensure UE4 finds the textures without external files.
+    texture_bytes: Dict[int, bytes] = {}
+    if options.embed_textures:
+        log("Reading texture bytes for embedding...")
+        for ti, _orig, abs_path in resolved:
+            if abs_path is None:
+                continue
+            data = read_texture_bytes(abs_path)
+            if data is not None:
+                texture_bytes[ti] = data
+        log(f"  read {len(texture_bytes)} texture(s) for embedding")
+
     if options.copy_textures:
         log(f"Copying textures next to FBX (subdir: {options.texture_subdir}/)...")
         name_map: dict = {}
@@ -91,7 +107,7 @@ def convert_pmx_to_fbx(
 
     # Write FBX
     log(f"Writing FBX: {out_path}")
-    write_fbx(model, out_path, options=options, log=log)
+    write_fbx(model, out_path, options=options, texture_bytes=texture_bytes, log=log)
 
     # Write sidecar JSON describing non-transferrable data
     sidecar_path = os.path.splitext(out_path)[0] + ".pmx_meta.json"

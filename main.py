@@ -43,6 +43,7 @@ def run_cli(args) -> int:
     options = ConversionOptions(
         scale=args.scale,
         copy_textures=not args.no_copy_textures,
+        embed_textures=not args.no_embed_textures,
         emit_morphs=not args.no_morphs,
         emit_bind_pose=not args.no_bind_pose,
     )
@@ -84,6 +85,7 @@ def run_gui() -> int:
         "output_path": tk.StringVar(),
         "scale": tk.DoubleVar(value=8.0),
         "copy_textures": tk.BooleanVar(value=True),
+        "embed_textures": tk.BooleanVar(value=True),
         "emit_morphs": tk.BooleanVar(value=True),
         "emit_bind_pose": tk.BooleanVar(value=True),
         "converting": False,
@@ -139,20 +141,30 @@ def run_gui() -> int:
     ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
     ttk.Checkbutton(
         opt_frame,
+        text="嵌入贴图到 FBX（推荐）/ Embed textures (recommended)",
+        variable=state["embed_textures"],
+    ).grid(row=2, column=0, columnspan=3, sticky="w")
+    ttk.Checkbutton(
+        opt_frame,
         text="导出顶点变形为 Blend Shape / Export morphs",
         variable=state["emit_morphs"],
-    ).grid(row=2, column=0, columnspan=3, sticky="w")
+    ).grid(row=3, column=0, columnspan=3, sticky="w")
     ttk.Checkbutton(
         opt_frame,
         text="写入 BindPose / Write bind pose",
         variable=state["emit_bind_pose"],
-    ).grid(row=3, column=0, columnspan=3, sticky="w")
+    ).grid(row=4, column=0, columnspan=3, sticky="w")
 
     # Convert button
     btn_frame = ttk.Frame(root)
     btn_frame.pack(fill="x", padx=10, pady=4)
     convert_btn = ttk.Button(btn_frame, text="▶ 转换 / Convert", command=lambda: _start_convert(state, log_widget, convert_btn))
     convert_btn.pack(side="left")
+    ttk.Button(
+        btn_frame,
+        text="打开输出目录 / Open Output Folder",
+        command=lambda: _open_output_dir(state, log_widget),
+    ).pack(side="left", padx=(8, 0))
     ttk.Label(
         btn_frame,
         text="(也可以把 .pmx 文件直接拖到 run.bat 上)",
@@ -211,6 +223,39 @@ def _auto_fill_output(state) -> None:
         state["output_path"].set(os.path.splitext(in_path)[0] + ".fbx")
 
 
+def _open_output_dir(state, log_widget) -> None:
+    """Open the directory containing the output FBX in the OS file explorer."""
+    from tkinter import messagebox
+
+    out_path = state["output_path"].get().strip().strip('"')
+    if not out_path:
+        in_path = state["input_path"].get().strip().strip('"')
+        if in_path:
+            out_path = os.path.splitext(in_path)[0] + ".fbx"
+            state["output_path"].set(out_path)
+        else:
+            messagebox.showinfo("提示", "请先选择输入或输出文件。")
+            return
+
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if not os.path.isdir(out_dir):
+        messagebox.showerror("错误", f"目录不存在：\n{out_dir}")
+        return
+
+    try:
+        if sys.platform == "win32":
+            os.startfile(out_dir)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            import subprocess
+            subprocess.Popen(["open", out_dir])
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", out_dir])
+        _log(log_widget, f"已打开目录：{out_dir}")
+    except Exception as e:
+        messagebox.showerror("错误", f"无法打开目录：\n{e}")
+
+
 def _log(log_widget, msg: str, tag: str = "") -> None:
     log_widget.config(state="normal")
     log_widget.insert("end", msg + "\n", tag if tag else ())
@@ -255,6 +300,7 @@ def _convert_worker(state, log_widget, convert_btn, in_path, out_path) -> None:
     options = ConversionOptions(
         scale=state["scale"].get(),
         copy_textures=state["copy_textures"].get(),
+        embed_textures=state["embed_textures"].get(),
         emit_morphs=state["emit_morphs"].get(),
         emit_bind_pose=state["emit_bind_pose"].get(),
     )
@@ -286,6 +332,7 @@ def main() -> int:
     parser.add_argument("output", nargs="?", help="output .fbx file (default: same as input)")
     parser.add_argument("--scale", type=float, default=8.0, help="scale factor (default: 8.0, 1 PMX unit = 8 cm)")
     parser.add_argument("--no-copy-textures", action="store_true", help="do not copy textures next to FBX")
+    parser.add_argument("--no-embed-textures", action="store_true", help="do not embed texture bytes inside FBX binary")
     parser.add_argument("--no-morphs", action="store_true", help="skip vertex morph export")
     parser.add_argument("--no-bind-pose", action="store_true", help="skip bind pose export")
     parser.add_argument("--gui", action="store_true", help="force GUI even if input is given")

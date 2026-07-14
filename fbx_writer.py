@@ -1,36 +1,37 @@
-"""FBX 7.4.0 ASCII writer for Unreal Engine 4.27.
+"""FBX 7.4.0 binary writer for Unreal Engine 4.27 with embedded textures.
 
-Zero external dependencies. Produces FBX 7400 ASCII files with:
-  - Mesh geometry (vertices, faces, normals, UVs, additional UVs as extra channels)
+Zero external dependencies (uses only Python standard library: struct, zlib,
+array, math, os). Produces FBX 7400 **binary** files with:
+  - Embedded texture data (Video.Content with MIME header, raw bytes)
+  - Mesh geometry (vertices, faces, normals, UVs, additional UVs)
   - Per-corner material assignment (LayerElementMaterial ByPolygon)
   - Phong materials with diffuse/specular/ambient/emissive
-  - Textures (Texture + Video) connected to material properties (DiffuseColor,
-    NormalMap, SpecularColor, EmissiveColor, AmbientColor, TransparencyColor)
-  - Sphere map textures (as additional texture on DiffuseColor or as separate slot)
-  - Toon textures (as EmissiveColor or separate)
-  - Bone hierarchy as Model "LimbNode" objects, with synthetic root bone if PMX
-    has multiple roots
+  - Textures connected to material properties
+  - Bone hierarchy as Model "LimbNode" objects, with synthetic "Root" bone
+    if PMX has multiple roots
   - Skinning: Skin Deformer + Cluster SubDeformers with Transform/TransformLink
-    (computed from bone world positions)
   - Vertex morphs as BlendShape + BlendShapeChannel + Shape (with deltas)
   - BindPose object
-  - Coordinate conversion PMX (Y-up, X-right, Z-forward) -> UE (Z-up, Y-right,
-    X-forward) via cyclic permutation (x,y,z) -> (z,x,y)
-  - UV V-flip (PMX top-left origin -> UE bottom-left origin)
-  - Triangle winding flip (PMX CW -> FBX CCW)
-  - Scale factor (default 1 PMX unit = 8 cm = 8 UE units)
+  - Coordinate conversion PMX (Y-up) -> UE (Z-up) via cyclic permutation
+  - UV V-flip, triangle winding flip, scale factor
 
-The writer is purpose-built for UE 4.27 import ("Skeletal Mesh" with
-"Import Morph Targets" enabled, "Convert Scene" on by default - which is a
-no-op because we already declare UE-native axes).
+Binary FBX format reference:
+  - Header: 27 bytes (magic + 0x1A00 + uint32 version)
+  - Node records: EndOffset/NumProps/PropListLen/NameLen/Name/Props/Children/NULL
+  - Properties: type char + data (Y/C/I/F/D/L/S/R and arrays i/l/f/d/b)
+  - Footer: 16 zero bytes + uint32(0) + uint32(version) + 4 zero bytes
 """
 
 from __future__ import annotations
 
+import array
 import math
 import os
+import struct
+import sys
+import zlib
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from pmx_reader import (
     PMXBone,
@@ -42,18 +43,17 @@ from pmx_reader import (
 
 
 # ---------------------------------------------------------------------------
-# Math utilities (no numpy)
+# Type aliases
 # ---------------------------------------------------------------------------
-
 
 Vec3 = Tuple[float, float, float]
 Vec4 = Tuple[float, float, float, float]
-Mat4 = Tuple[
-    float, float, float, float,
-    float, float, float, float,
-    float, float, float, float,
-    float, float, float, float,
-]
+Mat4 = Tuple[float, ...]
+
+
+# ---------------------------------------------------------------------------
+# Math utilities (no numpy)
+# ---------------------------------------------------------------------------
 
 
 def v_add(a: Vec3, b: Vec3) -> Vec3:
@@ -97,59 +97,6 @@ def permute(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
     return (v[2], v[0], v[1])
 
 
-def permute_quat(q: Vec4) -> Vec4:
-    """Conjugate a PMX-space quaternion by T = (0.5, 0.5, 0.5, 0.5) to express
-    the same rotation in UE space. T performs the cyclic permutation on vectors.
-    q' = T * q * T^{-1}. For T = (0.5,0.5,0.5,0.5) we have T^{-1} = T (since T
-    is a 180-degree rotation around (1,1,1) — actually a 120-degree rotation,
-    but T*T*T = identity, so T^{-1} = T*T). We just compute the sandwich.
-    """
-    tw, tx, ty, tz = q
-    # T = (0.5, 0.5, 0.5, 0.5)
-    Tw, Tx, Ty, Tz = 0.5, 0.5, 0.5, 0.5
-    # Tinv = T*T = quaternion square of T
-    # T*T = (Tw*Tw - Tx*Tx - Ty*Ty - Tz*Tz,
-    #        2*Tw*Tx, 2*Tw*Ty, 2*Tw*Tz)  [since Tx=Ty=Tz=0.5, Tw=0.5]
-    # = (0.25 - 0.25 - 0.25 - 0.25, 0.5, 0.5, 0.5)
-    # = (-0.5, 0.5, 0.5, 0.5)
-    IW, IX, IY, IZ = -0.5, 0.5, 0.5, 0.5
-    # tmp = T * q
-    rw = Tw * tw - Tx * tx - Ty * ty - Tz * tz
-    rx = Tw * tx + Tx * tw + Ty * tz - Tz * ty
-    ry = Tw * ty - Tx * tz + Ty * tw + Tz * tx
-    rz = Tw * tz + Tx * ty - Ty * tx + Tz * tw
-    # result = tmp * Tinv
-    sw = rw * IW - rx * IX - ry * IY - rz * IZ
-    sx = rw * IX + rx * IW + ry * IZ - rz * IY
-    sy = rw * IY - rx * IZ + ry * IW + rz * IX
-    sz = rw * IZ + rx * IY - ry * IX + rz * IW
-    return (sw, sx, sy, sz)
-
-
-def quat_to_euler_deg(q: Vec4) -> Vec3:
-    """Convert quaternion (w, x, y, z) to Euler angles in degrees (XYZ order
-    as FBX expects for Lcl Rotation)."""
-    w, x, y, z = q
-    # Normalize to be safe
-    n = math.sqrt(w * w + x * x + y * y + z * z)
-    if n < 1e-12:
-        return (0.0, 0.0, 0.0)
-    w, x, y, z = w / n, x / n, y / n, z / n
-    # Pitch (X)
-    sinp = 2.0 * (w * x + y * z)
-    cos_p = 1.0 - 2.0 * (x * x + y * y)
-    pitch = math.atan2(sinp, cos_p)
-    # Yaw (Y)
-    siny = 2.0 * (w * y - z * x)
-    siny = max(-1.0, min(1.0, siny))
-    yaw = math.asin(siny)
-    # Roll (Z)
-    sinr = 2.0 * (w * z + x * y)
-    cos_r = 1.0 - 2.0 * (y * y + z * z)
-    roll = math.atan2(sinr, cos_r)
-    return (math.degrees(pitch), math.degrees(yaw), math.degrees(roll))
-
-
 def mat4_identity() -> Mat4:
     return (
         1.0, 0.0, 0.0, 0.0,
@@ -168,18 +115,6 @@ def mat4_translation(t: Vec3) -> Mat4:
     )
 
 
-def mat4_mul(a: Mat4, b: Mat4) -> Mat4:
-    """Row-major 4x4 multiplication: result = a * b."""
-    r = [0.0] * 16
-    for i in range(4):
-        for j in range(4):
-            s = 0.0
-            for k in range(4):
-                s += a[i * 4 + k] * b[k * 4 + j]
-            r[i * 4 + j] = s
-    return tuple(r)  # type: ignore
-
-
 # ---------------------------------------------------------------------------
 # ID allocator
 # ---------------------------------------------------------------------------
@@ -196,50 +131,197 @@ class _IDGen:
 
 
 # ---------------------------------------------------------------------------
-# FBX ASCII emitter
+# Binary FBX node tree and serialization
 # ---------------------------------------------------------------------------
 
 
-def _fmt_num(v: float) -> str:
-    """Format a float for FBX ASCII. Use sufficient precision but no scientific
-    notation, no trailing zeros beyond what's needed."""
-    if v == int(v) and abs(v) < 1e15:
-        return f"{int(v)}"
-    s = f"{v:.6f}"
-    # Trim trailing zeros but keep at least one decimal
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-        if s == "" or s == "-":
-            s = "0"
-    return s
+class _Node:
+    """A single FBX binary node: name + properties + children."""
+
+    __slots__ = ("name", "props", "children")
+
+    def __init__(
+        self,
+        name: str = "",
+        props: Optional[List[Tuple[str, Any]]] = None,
+        children: Optional[List["_Node"]] = None,
+    ):
+        self.name = name
+        self.props: List[Tuple[str, Any]] = props if props is not None else []
+        self.children: List[_Node] = children if children is not None else []
+
+    def add_prop(self, type_code: str, value: Any) -> None:
+        self.props.append((type_code, value))
+
+    def add_child(self, node: "_Node") -> "_Node":
+        self.children.append(node)
+        return node
 
 
-def _fmt_arr(values: List[float], per_line: int = 16) -> str:
-    """Format a flat list of numbers as an FBX array body (after 'a: ').
+# Property type sizes (for the data part, excluding the 1-byte type code)
+_PROP_DATA_SIZE: Dict[str, int] = {
+    "Y": 2,   # int16
+    "C": 1,   # bool/uint8
+    "I": 4,   # int32
+    "F": 4,   # float32
+    "D": 8,   # float64
+    "L": 8,   # int64
+}
 
-    Wraps to per_line entries per line for readability.
+_ARRAY_ELEM_SIZE: Dict[str, int] = {
+    "i": 4,   # int32 array
+    "l": 8,   # int64 array
+    "f": 4,   # float32 array
+    "d": 8,   # float64 array
+    "b": 1,   # bool array
+}
+
+
+def _property_size(prop: Tuple[str, Any]) -> int:
+    """Compute the byte size of a serialized property (including type code)."""
+    tc = prop[0]
+    if tc in _PROP_DATA_SIZE:
+        return 1 + _PROP_DATA_SIZE[tc]
+    elif tc in ("S", "R"):
+        data = prop[1]
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        return 1 + 4 + len(data)
+    elif tc in _ARRAY_ELEM_SIZE:
+        data = prop[1]
+        count = len(data)
+        # type(1) + count(4) + encoding(4) + compressed_length(4) + data
+        # We compute the actual size after compression attempt
+        raw_bytes = _pack_array(tc, data)
+        compressed = zlib.compress(raw_bytes, 1)
+        if len(compressed) < len(raw_bytes):
+            return 1 + 4 + 4 + 4 + len(compressed)
+        else:
+            return 1 + 4 + 4 + 4 + len(raw_bytes)
+    return 0
+
+
+def _pack_array(type_code: str, data: List[Any]) -> bytes:
+    """Pack a Python list into raw bytes for an FBX array property."""
+    if type_code == "i":
+        arr = array.array("i", data)
+    elif type_code == "l":
+        arr = array.array("q", data)
+    elif type_code == "f":
+        arr = array.array("f", data)
+    elif type_code == "d":
+        arr = array.array("d", data)
+    elif type_code == "b":
+        arr = array.array("B", [1 if v else 0 for v in data])
+    else:
+        return b""
+    # Ensure little-endian
+    if arr.itemsize > 1 and sys.byteorder == "big":
+        arr.byteswap()
+    return arr.tobytes()
+
+
+def _serialize_property(prop: Tuple[str, Any]) -> bytes:
+    """Serialize a single property to bytes."""
+    tc = prop[0]
+    out = tc.encode("ascii")
+    if tc == "Y":  # int16
+        out += struct.pack("<h", int(prop[1]))
+    elif tc == "C":  # bool
+        out += struct.pack("<B", 1 if prop[1] else 0)
+    elif tc == "I":  # int32
+        out += struct.pack("<i", int(prop[1]))
+    elif tc == "F":  # float32
+        out += struct.pack("<f", float(prop[1]))
+    elif tc == "D":  # float64
+        out += struct.pack("<d", float(prop[1]))
+    elif tc == "L":  # int64
+        out += struct.pack("<q", int(prop[1]))
+    elif tc == "S":  # string
+        data = prop[1]
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        out += struct.pack("<I", len(data)) + data
+    elif tc == "R":  # raw bytes
+        data = prop[1]
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        out += struct.pack("<I", len(data)) + data
+    elif tc in _ARRAY_ELEM_SIZE:  # arrays
+        data = prop[1]
+        count = len(data)
+        raw_bytes = _pack_array(tc, data)
+        # Try zlib compression
+        compressed = zlib.compress(raw_bytes, 1)
+        if len(compressed) < len(raw_bytes):
+            out += struct.pack("<III", count, 1, len(compressed))
+            out += compressed
+        else:
+            out += struct.pack("<III", count, 0, len(raw_bytes))
+            out += raw_bytes
+    return out
+
+
+def _node_size(node: _Node) -> int:
+    """Compute total byte size of a serialized node (including children + NULL)."""
+    name_bytes = node.name.encode("utf-8")
+    header_size = 13 + len(name_bytes)  # EndOffset(4)+NumProps(4)+PropListLen(4)+NameLen(1)+Name
+    props_size = sum(_property_size(p) for p in node.props)
+    children_size = 0
+    if node.children:
+        for child in node.children:
+            children_size += _node_size(child)
+        children_size += 13  # NULL record
+    return header_size + props_size + children_size
+
+
+def _serialize_node(node: _Node, base_offset: int) -> bytes:
+    """Serialize a node and all its children to bytes.
+
+    Args:
+      node: the node to serialize.
+      base_offset: absolute file offset where this node starts.
     """
-    parts = [_fmt_num(v) for v in values]
-    lines = []
-    for i in range(0, len(parts), per_line):
-        lines.append(",".join(parts[i : i + per_line]))
-    return ",\n\t\t".join(lines)
+    name_bytes = node.name.encode("utf-8")
+
+    # Serialize properties
+    props_bytes = b"".join(_serialize_property(p) for p in node.props)
+
+    # Offset where children start
+    children_start = base_offset + 13 + len(name_bytes) + len(props_bytes)
+
+    # Serialize children
+    children_bytes = b""
+    if node.children:
+        child_offset = children_start
+        for child in node.children:
+            child_bytes = _serialize_node(child, child_offset)
+            children_bytes += child_bytes
+            child_offset += len(child_bytes)
+        # NULL record (13 zero bytes)
+        children_bytes += b"\x00" * 13
+
+    # EndOffset = first byte after this node
+    end_offset = children_start + len(children_bytes)
+
+    # Header
+    header = struct.pack("<III", end_offset, len(node.props), len(props_bytes))
+    header += struct.pack("B", len(name_bytes))
+    header += name_bytes
+
+    return header + props_bytes + children_bytes
 
 
-def _quote(s: str) -> str:
-    """Escape a string for an FBX ASCII double-quoted literal."""
-    # FBX ASCII uses backslash escaping; we keep it conservative.
-    s = s.replace("\\", "/")  # normalize path separators
-    s = s.replace('"', '\\"')
-    return f'"{s}"'
+# ---------------------------------------------------------------------------
+# FBX file builder
+# ---------------------------------------------------------------------------
 
 
 class _FBXFile:
+    """Builds an in-memory FBX binary node tree and serializes it."""
+
     def __init__(self):
-        self.objects: List[str] = []
-        self.connections: List[str] = []
         self.id_gen = _IDGen()
-        # type -> count, for Definitions
         self.type_counts: Dict[str, int] = {
             "Model": 0,
             "Geometry": 0,
@@ -250,32 +332,169 @@ class _FBXFile:
             "SubDeformer": 0,
             "Pose": 0,
         }
+        # Top-level nodes
+        self._root = _Node()  # implicit top-level (empty name)
+        self._header_ext = self._root.add_child(_Node("FBXHeaderExtension"))
+        self._global_settings = self._root.add_child(_Node("GlobalSettings"))
+        self._documents = self._root.add_child(_Node("Documents"))
+        self._definitions = self._root.add_child(_Node("Definitions"))
+        self._objects = self._root.add_child(_Node("Objects"))
+        self._connections = self._root.add_child(_Node("Connections"))
+        self._takes = self._root.add_child(_Node("Takes"))
+
+        self._init_header()
+        self._init_global_settings()
+        self._init_documents()
 
     def _count(self, t: str) -> None:
         self.type_counts[t] = self.type_counts.get(t, 0) + 1
 
-    # ---- object emitters (each appends to self.objects) ----
+    # ---- header / global settings / documents ----
+
+    def _init_header(self) -> None:
+        h = self._header_ext
+        h.add_child(_Node("FBXHeaderVersion", [("I", 1003)]))
+        h.add_child(_Node("FBXVersion", [("I", 7400)]))
+        ts = h.add_child(_Node("CreationTimeStamp"))
+        ts.add_child(_Node("Version", [("I", 1000)]))
+        ts.add_child(_Node("Year", [("I", 2026)]))
+        ts.add_child(_Node("Month", [("I", 7)]))
+        ts.add_child(_Node("Day", [("I", 14)]))
+        ts.add_child(_Node("Hour", [("I", 0)]))
+        ts.add_child(_Node("Minute", [("I", 0)]))
+        ts.add_child(_Node("Second", [("I", 0)]))
+        ts.add_child(_Node("Millisecond", [("I", 0)]))
+        h.add_child(_Node("Creator", [("S", "pmx2fbx")]))
+        si = h.add_child(_Node("SceneInfo"))
+        si.props = [("S", "SceneInfo::GlobalInfo"), ("S", "UserData")]
+        si.add_child(_Node("Type", [("S", "UserData")]))
+        si.add_child(_Node("Version", [("I", 100)]))
+        md = si.add_child(_Node("MetaData"))
+        md.add_child(_Node("Version", [("I", 100)]))
+        md.add_child(_Node("Title", [("S", "")]))
+        md.add_child(_Node("Subject", [("S", "")]))
+        md.add_child(_Node("Author", [("S", "")]))
+        md.add_child(_Node("Keywords", [("S", "")]))
+        md.add_child(_Node("Revision", [("S", "")]))
+        md.add_child(_Node("Comment", [("S", "")]))
+        p70 = si.add_child(_Node("Properties70"))
+        p70.add_child(_Node("P", [("S", "DocumentUrl"), ("S", "KString"), ("S", "Url"), ("S", ""), ("S", "")]))
+        p70.add_child(_Node("P", [("S", "SrcDocumentUrl"), ("S", "KString"), ("S", "Url"), ("S", ""), ("S", "")]))
+        p70.add_child(_Node("P", [("S", "Original"), ("S", "Compound"), ("S", ""), ("S", "")]))
+        p70.add_child(_Node("P", [("S", "Original|ApplicationVendor"), ("S", "KString"), ("S", ""), ("S", ""), ("S", "AkizukiKokona")]))
+        p70.add_child(_Node("P", [("S", "Original|ApplicationName"), ("S", "KString"), ("S", ""), ("S", ""), ("S", "pmx2fbx")]))
+        p70.add_child(_Node("P", [("S", "Original|ApplicationVersion"), ("S", "KString"), ("S", ""), ("S", ""), ("S", "1.0")]))
+        p70.add_child(_Node("P", [("S", "LastSaved"), ("S", "Compound"), ("S", ""), ("S", "")]))
+        p70.add_child(_Node("P", [("S", "LastSaved|ApplicationVendor"), ("S", "KString"), ("S", ""), ("S", ""), ("S", "AkizukiKokona")]))
+        p70.add_child(_Node("P", [("S", "LastSaved|ApplicationName"), ("S", "KString"), ("S", ""), ("S", ""), ("S", "pmx2fbx")]))
+        p70.add_child(_Node("P", [("S", "LastSaved|ApplicationVersion"), ("S", "KString"), ("S", ""), ("S", ""), ("S", "1.0")]))
+
+    def _init_global_settings(self) -> None:
+        gs = self._global_settings
+        gs.add_child(_Node("Version", [("I", 1000)]))
+        p70 = gs.add_child(_Node("Properties70"))
+        # UE native: Z up (2), X front (1), Y coord (0)
+        p70.add_child(_Node("P", [("S", "UpAxis"), ("S", "int"), ("S", "Integer"), ("S", ""), ("I", 2)]))
+        p70.add_child(_Node("P", [("S", "UpAxisSign"), ("S", "int"), ("S", "Integer"), ("S", ""), ("I", 1)]))
+        p70.add_child(_Node("P", [("S", "FrontAxis"), ("S", "int"), ("S", "Integer"), ("S", ""), ("I", 1)]))
+        p70.add_child(_Node("P", [("S", "FrontAxisSign"), ("S", "int"), ("S", "Integer"), ("S", ""), ("I", 1)]))
+        p70.add_child(_Node("P", [("S", "CoordAxis"), ("S", "int"), ("S", "Integer"), ("S", ""), ("I", 0)]))
+        p70.add_child(_Node("P", [("S", "CoordAxisSign"), ("S", "int"), ("S", "Integer"), ("S", ""), ("I", 1)]))
+        p70.add_child(_Node("P", [("S", "OriginalUpAxis"), ("S", "int"), ("S", "Integer"), ("S", ""), ("I", 2)]))
+        p70.add_child(_Node("P", [("S", "OriginalUpAxisSign"), ("S", "int"), ("S", "Integer"), ("S", ""), ("I", 1)]))
+        p70.add_child(_Node("P", [("S", "UnitScaleFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)]))
+        p70.add_child(_Node("P", [("S", "OriginalUnitScaleFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)]))
+        p70.add_child(_Node("P", [("S", "AmbientColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)]))
+        p70.add_child(_Node("P", [("S", "DefaultCamera"), ("S", "KString"), ("S", ""), ("S", ""), ("S", "Producer Perspective")]))
+        p70.add_child(_Node("P", [("S", "TimeMode"), ("S", "enum"), ("S", ""), ("S", ""), ("I", 0)]))
+        p70.add_child(_Node("P", [("S", "TimeSpanStart"), ("S", "KTime"), ("S", "Time"), ("S", ""), ("L", 0)]))
+        p70.add_child(_Node("P", [("S", "TimeSpanStop"), ("S", "KTime"), ("S", "Time"), ("S", ""), ("L", 46186158000)]))
+        p70.add_child(_Node("P", [("S", "CustomFrameRate"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", -1.0)]))
+
+    def _init_documents(self) -> None:
+        doc_id = 1000000000
+        self._documents.add_child(_Node("Count", [("I", 1)]))
+        doc = self._documents.add_child(_Node("Document", [("L", doc_id), ("S", ""), ("S", "Scene")]))
+        p70 = doc.add_child(_Node("Properties70"))
+        p70.add_child(_Node("P", [("S", "SourceObject"), ("S", "object"), ("S", ""), ("S", "")]))
+        p70.add_child(_Node("P", [("S", "ActiveAnimStackName"), ("S", "KString"), ("S", ""), ("S", ""), ("S", "")]))
+        doc.add_child(_Node("RootNode", [("L", 0)]))
+
+    def build_definitions(self) -> None:
+        """Build the Definitions section from type_counts. Call before render."""
+        d = self._definitions
+        d.add_child(_Node("Version", [("I", 100)]))
+        object_types = [
+            ("GlobalSettings", 1),
+            ("Model", self.type_counts.get("Model", 0)),
+            ("Geometry", self.type_counts.get("Geometry", 0)),
+            ("Material", self.type_counts.get("Material", 0)),
+            ("Texture", self.type_counts.get("Texture", 0)),
+            ("Video", self.type_counts.get("Video", 0)),
+            ("Deformer", self.type_counts.get("Deformer", 0)),
+            ("SubDeformer", self.type_counts.get("SubDeformer", 0)),
+            ("Pose", self.type_counts.get("Pose", 0)),
+        ]
+        count = sum(1 for _, c in object_types if c > 0)
+        d.add_child(_Node("Count", [("I", count)]))
+
+        # GlobalSettings
+        ot = d.add_child(_Node("ObjectType", [("S", "GlobalSettings")]))
+        ot.add_child(_Node("Count", [("I", 1)]))
+
+        # Model
+        if self.type_counts.get("Model", 0) > 0:
+            ot = d.add_child(_Node("ObjectType", [("S", "Model")]))
+            ot.add_child(_Node("Count", [("I", self.type_counts["Model"])]))
+            pt = ot.add_child(_Node("PropertyTemplate", [("S", "FbxNode")]))
+            p70 = pt.add_child(_Node("Properties70"))
+            for p in _MODEL_PROPS_TEMPLATE:
+                p70.add_child(_Node("P", p))
+
+        # Geometry
+        if self.type_counts.get("Geometry", 0) > 0:
+            ot = d.add_child(_Node("ObjectType", [("S", "Geometry")]))
+            ot.add_child(_Node("Count", [("I", self.type_counts["Geometry"])]))
+            pt = ot.add_child(_Node("PropertyTemplate", [("S", "FbxMesh")]))
+            p70 = pt.add_child(_Node("Properties70"))
+            p70.add_child(_Node("P", [("S", "Color"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", 0.8), ("D", 0.8), ("D", 0.8)]))
+            p70.add_child(_Node("P", [("S", "BBoxMin"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)]))
+            p70.add_child(_Node("P", [("S", "BBoxMax"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)]))
+            p70.add_child(_Node("P", [("S", "Primary Visibility"), ("S", "bool"), ("S", ""), ("S", ""), ("C", True)]))
+            p70.add_child(_Node("P", [("S", "Casts Shadows"), ("S", "bool"), ("S", ""), ("S", ""), ("C", True)]))
+            p70.add_child(_Node("P", [("S", "Receive Shadows"), ("S", "bool"), ("S", ""), ("S", ""), ("C", True)]))
+
+        # Material
+        if self.type_counts.get("Material", 0) > 0:
+            ot = d.add_child(_Node("ObjectType", [("S", "Material")]))
+            ot.add_child(_Node("Count", [("I", self.type_counts["Material"])]))
+            pt = ot.add_child(_Node("PropertyTemplate", [("S", "FbxSurfacePhong")]))
+            p70 = pt.add_child(_Node("Properties70"))
+            for p in _MATERIAL_PROPS_TEMPLATE:
+                p70.add_child(_Node("P", p))
+
+        # Texture, Video, Deformer, SubDeformer, Pose
+        for tname in ("Texture", "Video", "Deformer", "SubDeformer", "Pose"):
+            if self.type_counts.get(tname, 0) > 0:
+                ot = d.add_child(_Node("ObjectType", [("S", tname)]))
+                ot.add_child(_Node("Count", [("I", self.type_counts[tname])]))
+
+    # ---- object emitters (add nodes to self._objects) ----
 
     def add_model_mesh(self, name: str, translation: Vec3 = (0.0, 0.0, 0.0)) -> int:
         oid = self.id_gen.new()
         self._count("Model")
-        obj = []
-        obj.append(f'\tModel: {oid}, "Model::{name}", "Mesh" {{')
-        obj.append("\t\tVersion: 232")
-        obj.append("\t\tProperties70:  {")
-        obj.append('\t\t\tP: "InheritType", "enum", "", "",1')
-        obj.append(
-            f'\t\t\tP: "Lcl Translation", "Lcl Translation", "", "A",'
-            f"{_fmt_num(translation[0])},{_fmt_num(translation[1])},{_fmt_num(translation[2])}"
-        )
-        obj.append('\t\t\tP: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,0')
-        obj.append('\t\t\tP: "Lcl Scaling", "Lcl Scaling", "", "A",1,1,1')
-        obj.append('\t\t\tP: "DefaultAttributeIndex", "int", "Integer", "",0')
-        obj.append("\t\t}")
-        obj.append("\t\tShading: T")
-        obj.append('\t\tCulling: "CullingOff"')
-        obj.append("\t}")
-        self.objects.append("\n".join(obj))
+        obj = _Node("Model", [("L", oid), ("S", f"Model::{name}"), ("S", "Mesh")])
+        obj.add_child(_Node("Version", [("I", 232)]))
+        p70 = obj.add_child(_Node("Properties70"))
+        p70.add_child(_Node("P", [("S", "InheritType"), ("S", "enum"), ("S", ""), ("S", ""), ("I", 1)]))
+        p70.add_child(_Node("P", [("S", "Lcl Translation"), ("S", "Lcl Translation"), ("S", ""), ("S", "A"), ("D", translation[0]), ("D", translation[1]), ("D", translation[2])]))
+        p70.add_child(_Node("P", [("S", "Lcl Rotation"), ("S", "Lcl Rotation"), ("S", ""), ("S", "A"), ("D", 0.0), ("D", 0.0), ("D", 0.0)]))
+        p70.add_child(_Node("P", [("S", "Lcl Scaling"), ("S", "Lcl Scaling"), ("S", ""), ("S", "A"), ("D", 1.0), ("D", 1.0), ("D", 1.0)]))
+        p70.add_child(_Node("P", [("S", "DefaultAttributeIndex"), ("S", "int"), ("S", "Integer"), ("S", ""), ("I", 0)]))
+        obj.add_child(_Node("Shading", [("Y", 1)]))  # T=True in ASCII -> Y(1) in binary
+        obj.add_child(_Node("Culling", [("S", "CullingOff")]))
+        self._objects.add_child(obj)
         return oid
 
     def add_model_bone(
@@ -283,40 +502,25 @@ class _FBXFile:
         name: str,
         translation: Vec3,
         rotation_euler_deg: Vec3 = (0.0, 0.0, 0.0),
-        pre_rotation: Optional[Vec3] = None,
     ) -> int:
         oid = self.id_gen.new()
         self._count("Model")
-        obj = []
-        obj.append(f'\tModel: {oid}, "Model::{name}", "LimbNode" {{')
-        obj.append("\t\tVersion: 232")
-        obj.append("\t\tProperties70:  {")
-        obj.append('\t\t\tP: "QuaternionInterpolate", "bool", "", "",0')
-        obj.append('\t\t\tP: "RotationActive", "bool", "", "",1')
-        obj.append('\t\t\tP: "InheritType", "enum", "", "",1')
-        if pre_rotation is not None:
-            obj.append(
-                f'\t\t\tP: "PreRotation", "Vector3D", "Vector", "",'
-                f"{_fmt_num(pre_rotation[0])},{_fmt_num(pre_rotation[1])},{_fmt_num(pre_rotation[2])}"
-            )
-        obj.append('\t\t\tP: "PostRotation", "Vector3D", "Vector", "",0,0,0')
-        obj.append('\t\t\tP: "RotationPivot", "Vector3D", "Vector", "",0,0,0')
-        obj.append('\t\t\tP: "RotationOffset", "Vector3D", "Vector", "",0,0,0')
-        obj.append(
-            f'\t\t\tP: "Lcl Translation", "Lcl Translation", "", "A+",'
-            f"{_fmt_num(translation[0])},{_fmt_num(translation[1])},{_fmt_num(translation[2])}"
-        )
-        obj.append(
-            f'\t\t\tP: "Lcl Rotation", "Lcl Rotation", "", "A+",'
-            f"{_fmt_num(rotation_euler_deg[0])},{_fmt_num(rotation_euler_deg[1])},{_fmt_num(rotation_euler_deg[2])}"
-        )
-        obj.append('\t\t\tP: "Lcl Scaling", "Lcl Scaling", "", "A+",1,1,1')
-        obj.append('\t\t\tP: "Visibility", "Visibility", "", "A",1')
-        obj.append("\t\t}")
-        obj.append("\t\tShading: Y")
-        obj.append('\t\tCulling: "CullingOff"')
-        obj.append("\t}")
-        self.objects.append("\n".join(obj))
+        obj = _Node("Model", [("L", oid), ("S", f"Model::{name}"), ("S", "LimbNode")])
+        obj.add_child(_Node("Version", [("I", 232)]))
+        p70 = obj.add_child(_Node("Properties70"))
+        p70.add_child(_Node("P", [("S", "QuaternionInterpolate"), ("S", "bool"), ("S", ""), ("S", ""), ("C", False)]))
+        p70.add_child(_Node("P", [("S", "RotationActive"), ("S", "bool"), ("S", ""), ("S", ""), ("C", True)]))
+        p70.add_child(_Node("P", [("S", "InheritType"), ("S", "enum"), ("S", ""), ("S", ""), ("I", 1)]))
+        p70.add_child(_Node("P", [("S", "PostRotation"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)]))
+        p70.add_child(_Node("P", [("S", "RotationPivot"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)]))
+        p70.add_child(_Node("P", [("S", "RotationOffset"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)]))
+        p70.add_child(_Node("P", [("S", "Lcl Translation"), ("S", "Lcl Translation"), ("S", ""), ("S", "A+"), ("D", translation[0]), ("D", translation[1]), ("D", translation[2])]))
+        p70.add_child(_Node("P", [("S", "Lcl Rotation"), ("S", "Lcl Rotation"), ("S", ""), ("S", "A+"), ("D", rotation_euler_deg[0]), ("D", rotation_euler_deg[1]), ("D", rotation_euler_deg[2])]))
+        p70.add_child(_Node("P", [("S", "Lcl Scaling"), ("S", "Lcl Scaling"), ("S", ""), ("S", "A+"), ("D", 1.0), ("D", 1.0), ("D", 1.0)]))
+        p70.add_child(_Node("P", [("S", "Visibility"), ("S", "Visibility"), ("S", ""), ("S", "A"), ("D", 1.0)]))
+        obj.add_child(_Node("Shading", [("Y", 1)]))
+        obj.add_child(_Node("Culling", [("S", "CullingOff")]))
+        self._objects.add_child(obj)
         return oid
 
     def add_geometry(
@@ -331,32 +535,15 @@ class _FBXFile:
         material_per_face: Optional[List[int]] = None,
         shape_blocks: Optional[List[Tuple[str, List[int], List[Vec3]]]] = None,
     ) -> int:
-        """Add a Geometry object.
-
-        Args:
-          vertices: list of (x,y,z) - control points (already in UE space)
-          faces: list of (v0, v1, v2) triangles
-          normals: per-corner normals, len == 3 * len(faces), UE space
-          uvs: list of unique (u, v) pairs (already V-flipped)
-          uv_indices: per-corner UV index, len == 3 * len(faces)
-          additional_uvs: optional list of additional UV layers; each layer is a
-                          list of (x,y,z,w) per control point (4 components).
-          material_per_face: optional material slot index per face; None means
-                             single material slot 0 for all faces.
-          shape_blocks: optional list of (name, indices, deltas) for blend shapes.
-        """
         oid = self.id_gen.new()
         self._count("Geometry")
-        obj = []
-        obj.append(f'\tGeometry: {oid}, "Geometry::{name}", "Mesh" {{')
+        obj = _Node("Geometry", [("L", oid), ("S", f"Geometry::{name}"), ("S", "Mesh")])
 
-        # Vertices
+        # Vertices: flat double array
         flat_v: List[float] = []
         for v in vertices:
             flat_v.extend(v)
-        obj.append(f"\t\tVertices: *{len(flat_v)} {{")
-        obj.append(f"\t\t\ta: {_fmt_arr(flat_v)}")
-        obj.append("\t\t}")
+        obj.add_child(_Node("Vertices", [("d", flat_v)]))
 
         # PolygonVertexIndex: triangles, last index bitwise-NOT
         pvi: List[int] = []
@@ -364,131 +551,94 @@ class _FBXFile:
             pvi.append(a)
             pvi.append(b)
             pvi.append(~c)
-        obj.append(f"\t\tPolygonVertexIndex: *{len(pvi)} {{")
-        obj.append(f"\t\t\ta: {','.join(str(i) for i in pvi)}")
-        obj.append("\t\t}")
+        obj.add_child(_Node("PolygonVertexIndex", [("i", pvi)]))
 
-        obj.append("\t\tGeometryVersion: 124")
+        obj.add_child(_Node("GeometryVersion", [("I", 124)]))
 
         # Normals (ByPolygonVertex Direct)
         flat_n: List[float] = []
         for n in normals:
             flat_n.extend(n)
-        obj.append("\t\tLayerElementNormal: 0 {")
-        obj.append("\t\t\tVersion: 101")
-        obj.append('\t\t\tName: ""')
-        obj.append('\t\t\tMappingInformationType: "ByPolygonVertex"')
-        obj.append('\t\t\tReferenceInformationType: "Direct"')
-        obj.append(f"\t\t\tNormals: *{len(flat_n)} {{")
-        obj.append(f"\t\t\t\ta: {_fmt_arr(flat_n)}")
-        obj.append("\t\t\t}")
-        obj.append(f"\t\t\tNormalsW: *{len(normals)} {{")
-        obj.append("\t\t\t\ta: " + ",".join(["1"] * len(normals)))
-        obj.append("\t\t\t}")
-        obj.append("\t\t}")
+        le_n = obj.add_child(_Node("LayerElementNormal", [("I", 0)]))
+        le_n.add_child(_Node("Version", [("I", 101)]))
+        le_n.add_child(_Node("Name", [("S", "")]))
+        le_n.add_child(_Node("MappingInformationType", [("S", "ByPolygonVertex")]))
+        le_n.add_child(_Node("ReferenceInformationType", [("S", "Direct")]))
+        le_n.add_child(_Node("Normals", [("d", flat_n)]))
+        le_n.add_child(_Node("NormalsW", [("d", [1.0] * len(normals))]))
 
         # Base UV layer
         flat_uv: List[float] = []
         for uv in uvs:
             flat_uv.extend(uv)
-        obj.append("\t\tLayerElementUV: 0 {")
-        obj.append("\t\t\tVersion: 101")
-        obj.append('\t\t\tName: "UVChannel_1"')
-        obj.append('\t\t\tMappingInformationType: "ByPolygonVertex"')
-        obj.append('\t\t\tReferenceInformationType: "IndexToDirect"')
-        obj.append(f"\t\t\tUV: *{len(flat_uv)} {{")
-        obj.append(f"\t\t\t\ta: {_fmt_arr(flat_uv)}")
-        obj.append("\t\t\t}")
-        obj.append(f"\t\t\tUVIndex: *{len(uv_indices)} {{")
-        obj.append("\t\t\t\ta: " + ",".join(str(i) for i in uv_indices))
-        obj.append("\t\t\t}")
-        obj.append("\t\t}")
+        le_uv = obj.add_child(_Node("LayerElementUV", [("I", 0)]))
+        le_uv.add_child(_Node("Version", [("I", 101)]))
+        le_uv.add_child(_Node("Name", [("S", "UVChannel_1")]))
+        le_uv.add_child(_Node("MappingInformationType", [("S", "ByPolygonVertex")]))
+        le_uv.add_child(_Node("ReferenceInformationType", [("S", "IndexToDirect")]))
+        le_uv.add_child(_Node("UV", [("d", flat_uv)]))
+        le_uv.add_child(_Node("UVIndex", [("i", uv_indices)]))
 
-        # Additional UV layers (PMX additional UVs as extra UV channels)
+        # Additional UV layers
         num_uv_layers = 1
         if additional_uvs:
             for layer_idx, layer in enumerate(additional_uvs):
-                # Each additional UV in PMX is a vec4; FBX UV is vec2.
-                # We use only the first two components (the standard MMD practice
-                # for additional UVs that aren't used for special effects).
                 flat_auv: List[float] = []
                 for auv in layer:
                     flat_auv.append(auv[0])
                     flat_auv.append(auv[1])
-                # UV index per corner = same as control point index (per-vertex)
                 auv_indices = [face[i] for face in faces for i in range(3)]
-                obj.append(f"\t\tLayerElementUV: {layer_idx + 1} {{")
-                obj.append("\t\t\tVersion: 101")
-                obj.append(f'\t\t\tName: "UVChannel_{layer_idx + 2}"')
-                obj.append('\t\t\tMappingInformationType: "ByPolygonVertex"')
-                obj.append('\t\t\tReferenceInformationType: "IndexToDirect"')
-                obj.append(f"\t\t\tUV: *{len(flat_auv)} {{")
-                obj.append(f"\t\t\t\ta: {_fmt_arr(flat_auv)}")
-                obj.append("\t\t\t}")
-                obj.append(f"\t\t\tUVIndex: *{len(auv_indices)} {{")
-                obj.append("\t\t\t\ta: " + ",".join(str(i) for i in auv_indices))
-                obj.append("\t\t\t}")
-                obj.append("\t\t}")
+                le = obj.add_child(_Node("LayerElementUV", [("I", layer_idx + 1)]))
+                le.add_child(_Node("Version", [("I", 101)]))
+                le.add_child(_Node("Name", [("S", f"UVChannel_{layer_idx + 2}")]))
+                le.add_child(_Node("MappingInformationType", [("S", "ByPolygonVertex")]))
+                le.add_child(_Node("ReferenceInformationType", [("S", "IndexToDirect")]))
+                le.add_child(_Node("UV", [("d", flat_auv)]))
+                le.add_child(_Node("UVIndex", [("i", auv_indices)]))
                 num_uv_layers += 1
 
         # Material layer
         if material_per_face is None:
-            obj.append("\t\tLayerElementMaterial: 0 {")
-            obj.append("\t\t\tVersion: 101")
-            obj.append('\t\t\tName: ""')
-            obj.append('\t\t\tMappingInformationType: "AllSame"')
-            obj.append('\t\t\tReferenceInformationType: "IndexToDirect"')
-            obj.append("\t\t\tMaterials: *1 {")
-            obj.append("\t\t\t\ta: 0")
-            obj.append("\t\t\t}")
-            obj.append("\t\t}")
+            le_mat = obj.add_child(_Node("LayerElementMaterial", [("I", 0)]))
+            le_mat.add_child(_Node("Version", [("I", 101)]))
+            le_mat.add_child(_Node("Name", [("S", "")]))
+            le_mat.add_child(_Node("MappingInformationType", [("S", "AllSame")]))
+            le_mat.add_child(_Node("ReferenceInformationType", [("S", "IndexToDirect")]))
+            le_mat.add_child(_Node("Materials", [("i", [0])]))
         else:
-            obj.append("\t\tLayerElementMaterial: 0 {")
-            obj.append("\t\t\tVersion: 101")
-            obj.append('\t\t\tName: ""')
-            obj.append('\t\t\tMappingInformationType: "ByPolygon"')
-            obj.append('\t\t\tReferenceInformationType: "IndexToDirect"')
-            obj.append(f"\t\t\tMaterials: *{len(material_per_face)} {{")
-            obj.append("\t\t\t\ta: " + ",".join(str(m) for m in material_per_face))
-            obj.append("\t\t\t}")
-            obj.append("\t\t}")
+            le_mat = obj.add_child(_Node("LayerElementMaterial", [("I", 0)]))
+            le_mat.add_child(_Node("Version", [("I", 101)]))
+            le_mat.add_child(_Node("Name", [("S", "")]))
+            le_mat.add_child(_Node("MappingInformationType", [("S", "ByPolygon")]))
+            le_mat.add_child(_Node("ReferenceInformationType", [("S", "IndexToDirect")]))
+            le_mat.add_child(_Node("Materials", [("i", material_per_face)]))
 
         # Layer binding
-        obj.append("\t\tLayer: 0 {")
-        obj.append("\t\t\tVersion: 100")
-        obj.append("\t\t\tLayerElement:  {")
-        obj.append('\t\t\t\tType: "LayerElementNormal"')
-        obj.append("\t\t\t\tTypedIndex: 0")
-        obj.append("\t\t\t}")
-        obj.append("\t\t\tLayerElement:  {")
-        obj.append('\t\t\t\tType: "LayerElementMaterial"')
-        obj.append("\t\t\t\tTypedIndex: 0")
-        obj.append("\t\t\t}")
+        layer = obj.add_child(_Node("Layer", [("I", 0)]))
+        layer.add_child(_Node("Version", [("I", 100)]))
+        le1 = layer.add_child(_Node("LayerElement"))
+        le1.add_child(_Node("Type", [("S", "LayerElementNormal")]))
+        le1.add_child(_Node("TypedIndex", [("I", 0)]))
+        le2 = layer.add_child(_Node("LayerElement"))
+        le2.add_child(_Node("Type", [("S", "LayerElementMaterial")]))
+        le2.add_child(_Node("TypedIndex", [("I", 0)]))
         for layer_idx in range(num_uv_layers):
-            obj.append("\t\t\tLayerElement:  {")
-            obj.append('\t\t\t\tType: "LayerElementUV"')
-            obj.append(f"\t\t\t\tTypedIndex: {layer_idx}")
-            obj.append("\t\t\t}")
-        obj.append("\t\t}")
+            le = layer.add_child(_Node("LayerElement"))
+            le.add_child(_Node("Type", [("S", "LayerElementUV")]))
+            le.add_child(_Node("TypedIndex", [("I", layer_idx)]))
 
-        # Shape blocks (blend shape deltas) - inside the Geometry
+        # Shape blocks (blend shape deltas)
         if shape_blocks:
             for shape_name, indices, deltas in shape_blocks:
                 flat_d: List[float] = []
                 for d in deltas:
                     flat_d.extend(d)
-                obj.append(f'\t\tShape: "{shape_name}" {{')
-                obj.append("\t\t\tVersion: 100")
-                obj.append(f"\t\t\tIndexes: *{len(indices)} {{")
-                obj.append("\t\t\t\ta: " + ",".join(str(i) for i in indices))
-                obj.append("\t\t\t}")
-                obj.append(f"\t\t\tVectors: *{len(flat_d)} {{")
-                obj.append(f"\t\t\t\ta: {_fmt_arr(flat_d)}")
-                obj.append("\t\t\t}")
-                obj.append("\t\t}")
+                shape = obj.add_child(_Node("Shape", [("S", shape_name)]))
+                shape.add_child(_Node("Version", [("I", 100)]))
+                shape.add_child(_Node("Indexes", [("i", indices)]))
+                shape.add_child(_Node("Vectors", [("d", flat_d)]))
 
-        obj.append("\t}")
-        self.objects.append("\n".join(obj))
+        self._objects.add_child(obj)
         return oid
 
     def add_material(
@@ -503,113 +653,89 @@ class _FBXFile:
     ) -> int:
         oid = self.id_gen.new()
         self._count("Material")
-        # Apply diffuse alpha to opacity if needed
-        if diffuse[3] < 1.0 and opacity >= 1.0:
-            opacity = diffuse[3]
-        obj = []
-        obj.append(f'\tMaterial: {oid}, "Material::{name}", "" {{')
-        obj.append("\t\tVersion: 102")
-        obj.append('\t\tShadingModel: "phong"')
-        obj.append("\t\tMultiLayer: 0")
-        obj.append("\t\tProperties70:  {")
-        obj.append('\t\t\tP: "ShadingModel", "KString", "", "", "phong"')
-        obj.append('\t\t\tP: "MultiLayer", "bool", "", "",0')
-        obj.append(
-            f'\t\t\tP: "EmissiveColor", "ColorRGB", "Color", "",'
-            f"{_fmt_num(emissive[0])},{_fmt_num(emissive[1])},{_fmt_num(emissive[2])}"
-        )
-        obj.append('\t\t\tP: "EmissiveFactor", "double", "Number", "",1')
-        obj.append(
-            f'\t\t\tP: "AmbientColor", "ColorRGB", "Color", "",'
-            f"{_fmt_num(ambient[0])},{_fmt_num(ambient[1])},{_fmt_num(ambient[2])}"
-        )
-        obj.append('\t\t\tP: "AmbientFactor", "double", "Number", "",1')
-        obj.append(
-            f'\t\t\tP: "DiffuseColor", "ColorRGB", "Color", "",'
-            f"{_fmt_num(diffuse[0])},{_fmt_num(diffuse[1])},{_fmt_num(diffuse[2])}"
-        )
-        obj.append('\t\t\tP: "DiffuseFactor", "double", "Number", "",1')
-        obj.append(
-            f'\t\t\tP: "SpecularColor", "ColorRGB", "Color", "",'
-            f"{_fmt_num(specular[0])},{_fmt_num(specular[1])},{_fmt_num(specular[2])}"
-        )
-        obj.append('\t\t\tP: "SpecularFactor", "double", "Number", "",1')
-        obj.append(
-            f'\t\t\tP: "ShininessExponent", "double", "Number", "",'
-            f"{_fmt_num(max(specular_strength, 0.0))}"
-        )
-        obj.append('\t\t\tP: "ReflectionColor", "ColorRGB", "Color", "",0,0,0')
-        obj.append('\t\t\tP: "ReflectionFactor", "double", "Number", "",0')
+        obj = _Node("Material", [("L", oid), ("S", f"Material::{name}"), ("S", "")])
+        obj.add_child(_Node("Version", [("I", 102)]))
+        obj.add_child(_Node("ShadingModel", [("S", "phong")]))
+        obj.add_child(_Node("MultiLayer", [("I", 0)]))
+        p70 = obj.add_child(_Node("Properties70"))
+        p70.add_child(_Node("P", [("S", "ShadingModel"), ("S", "KString"), ("S", ""), ("S", ""), ("S", "phong")]))
+        p70.add_child(_Node("P", [("S", "MultiLayer"), ("S", "bool"), ("S", ""), ("S", ""), ("C", False)]))
+        p70.add_child(_Node("P", [("S", "EmissiveColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", emissive[0]), ("D", emissive[1]), ("D", emissive[2])]))
+        p70.add_child(_Node("P", [("S", "EmissiveFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)]))
+        p70.add_child(_Node("P", [("S", "AmbientColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", ambient[0]), ("D", ambient[1]), ("D", ambient[2])]))
+        p70.add_child(_Node("P", [("S", "AmbientFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)]))
+        p70.add_child(_Node("P", [("S", "DiffuseColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", diffuse[0]), ("D", diffuse[1]), ("D", diffuse[2])]))
+        p70.add_child(_Node("P", [("S", "DiffuseFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)]))
+        p70.add_child(_Node("P", [("S", "SpecularColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", specular[0]), ("D", specular[1]), ("D", specular[2])]))
+        p70.add_child(_Node("P", [("S", "SpecularFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)]))
+        p70.add_child(_Node("P", [("S", "ShininessExponent"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", max(specular_strength, 0.0))]))
+        p70.add_child(_Node("P", [("S", "ReflectionColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)]))
+        p70.add_child(_Node("P", [("S", "ReflectionFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)]))
         if opacity < 1.0:
-            obj.append('\t\t\tP: "TransparentColor", "ColorRGB", "Color", "",1,1,1')
-            obj.append(
-                f'\t\t\tP: "TransparencyFactor", "double", "Number", "",'
-                f"{_fmt_num(1.0 - opacity)}"
-            )
-        obj.append("\t\t}")
-        obj.append("\t}")
-        self.objects.append("\n".join(obj))
+            p70.add_child(_Node("P", [("S", "TransparentColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", 1.0), ("D", 1.0), ("D", 1.0)]))
+            p70.add_child(_Node("P", [("S", "TransparencyFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0 - opacity)]))
+        self._objects.add_child(obj)
         return oid
 
     def add_texture(self, name: str, relative_filename: str, uv_set: str = "UVChannel_1") -> int:
         oid = self.id_gen.new()
         self._count("Texture")
-        obj = []
-        obj.append(f'\tTexture: {oid}, "Texture::{name}", "" {{')
-        obj.append('\t\tType: "TextureVideoClip"')
-        obj.append("\t\tVersion: 202")
-        obj.append(f'\t\tTextureName: "Texture::{name}"')
-        obj.append("\t\tProperties70:  {")
-        obj.append('\t\t\tP: "CurrentTextureBlendMode", "enum", "", "",0')
-        obj.append(f'\t\t\tP: "UVSet", "KString", "", "", "{uv_set}"')
-        obj.append('\t\t\tP: "UseMaterial", "bool", "", "",1')
-        obj.append("\t\t}")
-        obj.append(f'\t\tMedia: "Video::{name}"')
-        obj.append(f"\t\tFileName: {_quote(relative_filename)}")
-        obj.append(f"\t\tRelativeFilename: {_quote(relative_filename)}")
-        obj.append("\t\tModelUVTranslation: 0,0")
-        obj.append("\t\tModelUVScaling: 1,1")
-        obj.append('\t\tTexture_Alpha_Source: "None"')
-        obj.append("\t\tCropping: 0,0,0,0")
-        obj.append("\t}")
-        self.objects.append("\n".join(obj))
+        obj = _Node("Texture", [("L", oid), ("S", f"Texture::{name}"), ("S", "")])
+        obj.add_child(_Node("Type", [("S", "TextureVideoClip")]))
+        obj.add_child(_Node("Version", [("I", 202)]))
+        obj.add_child(_Node("TextureName", [("S", f"Texture::{name}")]))
+        p70 = obj.add_child(_Node("Properties70"))
+        p70.add_child(_Node("P", [("S", "CurrentTextureBlendMode"), ("S", "enum"), ("S", ""), ("S", ""), ("I", 0)]))
+        p70.add_child(_Node("P", [("S", "UVSet"), ("S", "KString"), ("S", ""), ("S", ""), ("S", uv_set)]))
+        p70.add_child(_Node("P", [("S", "UseMaterial"), ("S", "bool"), ("S", ""), ("S", ""), ("C", True)]))
+        obj.add_child(_Node("Media", [("S", f"Video::{name}")]))
+        fname = relative_filename.replace("\\", "/")
+        obj.add_child(_Node("FileName", [("S", fname)]))
+        obj.add_child(_Node("RelativeFilename", [("S", fname)]))
+        obj.add_child(_Node("ModelUVTranslation", [("D", 0.0), ("D", 0.0)]))
+        obj.add_child(_Node("ModelUVScaling", [("D", 1.0), ("D", 1.0)]))
+        obj.add_child(_Node("Texture_Alpha_Source", [("S", "None")]))
+        obj.add_child(_Node("Cropping", [("I", 0), ("I", 0), ("I", 0), ("I", 0)]))
+        self._objects.add_child(obj)
         return oid
 
-    def add_video(self, name: str, relative_filename: str) -> int:
+    def add_video(
+        self,
+        name: str,
+        relative_filename: str,
+        content_bytes: Optional[bytes] = None,
+    ) -> int:
         oid = self.id_gen.new()
         self._count("Video")
-        obj = []
-        obj.append(f'\tVideo: {oid}, "Video::{name}", "Clip" {{')
-        obj.append('\t\tType: "Clip"')
-        obj.append("\t\tProperties70:  {")
-        obj.append(f'\t\t\tP: "Path", "KString", "XRefUrl", "", {_quote(relative_filename)}')
-        obj.append("\t\t}")
-        obj.append("\t\tUseMipMap: 0")
-        obj.append(f"\t\tFilename: {_quote(relative_filename)}")
-        obj.append(f"\t\tRelativeFilename: {_quote(relative_filename)}")
-        obj.append("\t}")
-        self.objects.append("\n".join(obj))
+        obj = _Node("Video", [("L", oid), ("S", f"Video::{name}"), ("S", "Clip")])
+        obj.add_child(_Node("Type", [("S", "Clip")]))
+        p70 = obj.add_child(_Node("Properties70"))
+        fname = relative_filename.replace("\\", "/")
+        p70.add_child(_Node("P", [("S", "Path"), ("S", "KString"), ("S", "XRefUrl"), ("S", ""), ("S", fname)]))
+        obj.add_child(_Node("UseMipMap", [("I", 0)]))
+        obj.add_child(_Node("Filename", [("S", fname)]))
+        obj.add_child(_Node("RelativeFilename", [("S", fname)]))
+        # Embedded content: raw bytes with MIME header
+        if content_bytes is not None:
+            obj.add_child(_Node("Content", [("R", content_bytes)]))
+        self._objects.add_child(obj)
         return oid
 
     def add_skin_deformer(self, name: str) -> int:
         oid = self.id_gen.new()
         self._count("Deformer")
-        obj = []
-        obj.append(f'\tDeformer: {oid}, "Deformer::{name}", "Skin" {{')
-        obj.append("\t\tVersion: 101")
-        obj.append("\t\tLink_DeformAcuracy: 50")
-        obj.append("\t}")
-        self.objects.append("\n".join(obj))
+        obj = _Node("Deformer", [("L", oid), ("S", f"Deformer::{name}"), ("S", "Skin")])
+        obj.add_child(_Node("Version", [("I", 101)]))
+        obj.add_child(_Node("Link_DeformAcuracy", [("D", 50.0)]))
+        self._objects.add_child(obj)
         return oid
 
     def add_blendshape_deformer(self, name: str) -> int:
         oid = self.id_gen.new()
         self._count("Deformer")
-        obj = []
-        obj.append(f'\tDeformer: {oid}, "Deformer::{name}", "BlendShape" {{')
-        obj.append("\t\tVersion: 100")
-        obj.append("\t}")
-        self.objects.append("\n".join(obj))
+        obj = _Node("Deformer", [("L", oid), ("S", f"Deformer::{name}"), ("S", "BlendShape")])
+        obj.add_child(_Node("Version", [("I", 100)]))
+        self._objects.add_child(obj)
         return oid
 
     def add_cluster(
@@ -622,294 +748,370 @@ class _FBXFile:
     ) -> int:
         oid = self.id_gen.new()
         self._count("SubDeformer")
-        obj = []
-        obj.append(f'\tSubDeformer: {oid}, "SubDeformer::{name}", "Cluster" {{')
-        obj.append("\t\tVersion: 100")
-        obj.append('\t\tUserData: "", ""')
-        obj.append(f"\t\tIndexes: *{len(indices)} {{")
-        obj.append("\t\t\ta: " + ",".join(str(i) for i in indices))
-        obj.append("\t\t}")
-        obj.append(f"\t\tWeights: *{len(weights)} {{")
-        obj.append("\t\t\ta: " + ",".join(_fmt_num(w) for w in weights))
-        obj.append("\t\t}")
-        obj.append("\t\tTransform: *16 {")
-        obj.append("\t\t\ta: " + _fmt_arr(list(transform)))
-        obj.append("\t\t}")
-        obj.append("\t\tTransformLink: *16 {")
-        obj.append("\t\t\ta: " + _fmt_arr(list(transform_link)))
-        obj.append("\t\t}")
-        obj.append("\t}")
-        self.objects.append("\n".join(obj))
+        obj = _Node("SubDeformer", [("L", oid), ("S", f"SubDeformer::{name}"), ("S", "Cluster")])
+        obj.add_child(_Node("Version", [("I", 100)]))
+        obj.add_child(_Node("UserData", [("S", ""), ("S", "")]))
+        obj.add_child(_Node("Indexes", [("i", indices)]))
+        obj.add_child(_Node("Weights", [("d", weights)]))
+        obj.add_child(_Node("Transform", [("d", list(transform))]))
+        obj.add_child(_Node("TransformLink", [("d", list(transform_link))]))
+        self._objects.add_child(obj)
         return oid
 
     def add_blendshape_channel(self, name: str) -> int:
         oid = self.id_gen.new()
         self._count("SubDeformer")
-        obj = []
-        obj.append(f'\tSubDeformer: {oid}, "SubDeformer::{name}", "BlendShapeChannel" {{')
-        obj.append("\t\tVersion: 100")
-        obj.append("\t\tDeformPercent: 0")
-        obj.append("\t\tFullWeights: *1 {")
-        obj.append("\t\t\ta: 100")
-        obj.append("\t\t}")
-        obj.append("\t}")
-        self.objects.append("\n".join(obj))
+        obj = _Node("SubDeformer", [("L", oid), ("S", f"SubDeformer::{name}"), ("S", "BlendShapeChannel")])
+        obj.add_child(_Node("Version", [("I", 100)]))
+        obj.add_child(_Node("DeformPercent", [("D", 0.0)]))
+        obj.add_child(_Node("FullWeights", [("d", [100.0])]))
+        self._objects.add_child(obj)
         return oid
 
     def add_bind_pose(self, name: str, nodes: List[Tuple[int, Mat4]]) -> int:
         oid = self.id_gen.new()
         self._count("Pose")
-        obj = []
-        obj.append(f'\tPose: {oid}, "Pose::{name}", "BindPose" {{')
-        obj.append('\t\tType: "BindPose"')
-        obj.append("\t\tVersion: 100")
-        obj.append(f"\t\tNbPoseNodes: {len(nodes)}")
+        obj = _Node("Pose", [("L", oid), ("S", f"Pose::{name}"), ("S", "BindPose")])
+        obj.add_child(_Node("Type", [("S", "BindPose")]))
+        obj.add_child(_Node("Version", [("I", 100)]))
+        obj.add_child(_Node("NbPoseNodes", [("I", len(nodes))]))
         for node_id, matrix in nodes:
-            obj.append("\t\tPoseNode:  {")
-            obj.append(f"\t\t\tNode: {node_id}")
-            obj.append("\t\t\tMatrix: *16 {")
-            obj.append("\t\t\t\ta: " + _fmt_arr(list(matrix)))
-            obj.append("\t\t\t}")
-            obj.append("\t\t}")
-        obj.append("\t}")
-        self.objects.append("\n".join(obj))
+            pn = obj.add_child(_Node("PoseNode"))
+            pn.add_child(_Node("Node", [("L", node_id)]))
+            pn.add_child(_Node("Matrix", [("d", list(matrix))]))
+        self._objects.add_child(obj)
         return oid
 
     # ---- connection helpers ----
 
     def connect_oo(self, child: int, parent: int) -> None:
-        self.connections.append(f'\tC: "OO",{child},{parent}')
+        self._connections.add_child(_Node("C", [("S", "OO"), ("L", child), ("L", parent)]))
 
     def connect_op(self, child: int, parent: int, prop: str) -> None:
-        self.connections.append(f'\tC: "OP",{child},{parent},"{prop}"')
+        self._connections.add_child(_Node("C", [("S", "OP"), ("L", child), ("L", parent), ("S", prop)]))
 
-    # ---- final emission ----
+    # ---- final serialization ----
 
-    def render(self, creator: str = "pmx2fbx") -> str:
-        # Compute Definitions count
-        # Each ObjectType counts its instances; we always include GlobalSettings.
-        object_types = [
-            ("GlobalSettings", 1),
-            ("Model", self.type_counts.get("Model", 0)),
-            ("Geometry", self.type_counts.get("Geometry", 0)),
-            ("Material", self.type_counts.get("Material", 0)),
-            ("Texture", self.type_counts.get("Texture", 0)),
-            ("Video", self.type_counts.get("Video", 0)),
-            ("Deformer", self.type_counts.get("Deformer", 0)),
-            ("SubDeformer", self.type_counts.get("SubDeformer", 0)),
-            ("Pose", self.type_counts.get("Pose", 0)),
-        ]
-        definitions_count = sum(1 for _, c in object_types if c > 0)
+    def render(self, creator: str = "pmx2fbx") -> bytes:
+        """Serialize the entire FBX binary file to bytes."""
+        # Build Definitions (must be done after all objects are added)
+        self.build_definitions()
 
-        out: List[str] = []
-        out.append("; FBX 7.4.0 project file")
-        out.append(f"; Generated by {creator}")
-        out.append("; For Unreal Engine 4.27 import (Skeletal Mesh + Morph Targets)")
-        out.append("; " + "-" * 52)
-        out.append("")
+        # Takes
+        self._takes.add_child(_Node("Version", [("I", 100)]))
+        tk = self._takes.add_child(_Node("Take"))
+        tk.props = [("S", "Current")]
+        tk.add_child(_Node("FileName", [("S", "")]))
+        tk.add_child(_Node("LocalTime", [("L", 0), ("L", 0)]))
+        tk.add_child(_Node("ReferenceTime", [("L", 0), ("L", 0)]))
 
-        # FBXHeaderExtension
-        out.append("FBXHeaderExtension:  {")
-        out.append("\tFBXHeaderVersion: 1003")
-        out.append("\tFBXVersion: 7400")
-        out.append("\tCreationTimeStamp:  {")
-        out.append("\t\tVersion: 1000")
-        out.append("\t\tYear: 2026")
-        out.append("\t\tMonth: 7")
-        out.append("\t\tDay: 14")
-        out.append("\t\tHour: 0")
-        out.append("\t\tMinute: 0")
-        out.append("\t\tSecond: 0")
-        out.append("\t\tMillisecond: 0")
-        out.append("\t}")
-        out.append(f"\tCreator: {_quote(creator)}")
-        out.append("\tSceneInfo: \"SceneInfo::GlobalInfo\", \"UserData\" {")
-        out.append('\t\tType: "UserData"')
-        out.append("\t\tVersion: 100")
-        out.append("\t\tMetaData:  {")
-        out.append("\t\t\tVersion: 100")
-        out.append('\t\t\tTitle: ""')
-        out.append('\t\t\tSubject: ""')
-        out.append('\t\t\tAuthor: ""')
-        out.append('\t\t\tKeywords: ""')
-        out.append('\t\t\tRevision: ""')
-        out.append('\t\t\tComment: ""')
-        out.append("\t\t}")
-        out.append("\t\tProperties70:  {")
-        out.append('\t\t\tP: "DocumentUrl", "KString", "Url", "", ""')
-        out.append('\t\t\tP: "SrcDocumentUrl", "KString", "Url", "", ""')
-        out.append('\t\t\tP: "Original", "Compound", "", ""')
-        out.append(f'\t\t\tP: "Original|ApplicationVendor", "KString", "", "", "AkizukiKokona"')
-        out.append(f'\t\t\tP: "Original|ApplicationName", "KString", "", "", "pmx2fbx"')
-        out.append('\t\t\tP: "Original|ApplicationVersion", "KString", "", "", "1.0"')
-        out.append('\t\t\tP: "LastSaved", "Compound", "", ""')
-        out.append('\t\t\tP: "LastSaved|ApplicationVendor", "KString", "", "", "AkizukiKokona"')
-        out.append('\t\t\tP: "LastSaved|ApplicationName", "KString", "", "", "pmx2fbx"')
-        out.append('\t\t\tP: "LastSaved|ApplicationVersion", "KString", "", "", "1.0"')
-        out.append("\t\t}")
-        out.append("\t}")
-        out.append("}")
-        out.append("")
+        # --- Serialize ---
+        # The root node is a virtual container; its children are the top-level
+        # FBX nodes. We serialize them sequentially with running offsets.
+        header = b"Kaydara FBX Binary\x00\x1a\x00" + struct.pack("<I", 7400)
+        body = bytearray()
+        offset = len(header)
+        for child in self._root.children:
+            cb = _serialize_node(child, offset)
+            body.extend(cb)
+            offset += len(cb)
+        # NULL record terminates the root
+        body.extend(b"\x00" * 13)
 
-        # GlobalSettings - UE native axes (Z up, X forward, Y right)
-        out.append("GlobalSettings:  {")
-        out.append("\tVersion: 1000")
-        out.append("\tProperties70:  {")
-        out.append('\t\tP: "UpAxis", "int", "Integer", "",2')
-        out.append('\t\tP: "UpAxisSign", "int", "Integer", "",1')
-        out.append('\t\tP: "FrontAxis", "int", "Integer", "",1')
-        out.append('\t\tP: "FrontAxisSign", "int", "Integer", "",1')
-        out.append('\t\tP: "CoordAxis", "int", "Integer", "",0')
-        out.append('\t\tP: "CoordAxisSign", "int", "Integer", "",1')
-        out.append('\t\tP: "OriginalUpAxis", "int", "Integer", "",2')
-        out.append('\t\tP: "OriginalUpAxisSign", "int", "Integer", "",1')
-        out.append('\t\tP: "UnitScaleFactor", "double", "Number", "",1')
-        out.append('\t\tP: "OriginalUnitScaleFactor", "double", "Number", "",1')
-        out.append('\t\tP: "AmbientColor", "ColorRGB", "Color", "",0,0,0')
-        out.append('\t\tP: "DefaultCamera", "KString", "", "", "Producer Perspective"')
-        out.append('\t\tP: "TimeMode", "enum", "", "",0')
-        out.append('\t\tP: "TimeSpanStart", "KTime", "Time", "",0')
-        out.append('\t\tP: "TimeSpanStop", "KTime", "Time", "",46186158000')
-        out.append('\t\tP: "CustomFrameRate", "double", "Number", "",-1')
-        out.append("\t}")
-        out.append("}")
-        out.append("")
+        # Footer: 16 zero bytes + uint32(0) + uint32(version) + 4 zero bytes
+        footer = b"\x00" * 16 + struct.pack("<II", 0, 7400) + b"\x00" * 4
+        return header + bytes(body) + footer
 
-        # Documents
-        doc_id = 1000000000
-        out.append("Documents:  {")
-        out.append("\tCount: 1")
-        out.append(f'\tDocument: {doc_id}, "", "Scene" {{')
-        out.append("\t\tProperties70:  {")
-        out.append('\t\t\tP: "SourceObject", "object", "", ""')
-        out.append('\t\t\tP: "ActiveAnimStackName", "KString", "", "", ""')
-        out.append("\t\t}")
-        out.append("\t\tRootNode: 0")
-        out.append("\t}")
-        out.append("}")
-        out.append("")
 
-        # Definitions
-        out.append("Definitions:  {")
-        out.append("\tVersion: 100")
-        out.append(f"\tCount: {definitions_count}")
-        out.append('\tObjectType: "GlobalSettings" {')
-        out.append("\t\tCount: 1")
-        out.append("\t}")
-        if self.type_counts.get("Model", 0) > 0:
-            out.append('\tObjectType: "Model" {')
-            out.append(f"\t\tCount: {self.type_counts['Model']}")
-            out.append('\t\tPropertyTemplate: "FbxNode" {')
-            out.append("\t\t\tProperties70:  {")
-            out.append('\t\t\t\tP: "QuaternionInterpolate", "bool", "", "",0')
-            out.append('\t\t\t\tP: "RotationOffset", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "RotationPivot", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "ScalingOffset", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "ScalingPivot", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "TranslationActive", "bool", "", "",0')
-            out.append('\t\t\t\tP: "TranslationMin", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "TranslationMax", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "RotationActive", "bool", "", "",0')
-            out.append('\t\t\t\tP: "RotationMin", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "RotationMax", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "InheritType", "enum", "", "",1')
-            out.append('\t\t\t\tP: "ScalingActive", "bool", "", "",0')
-            out.append('\t\t\t\tP: "ScalingMin", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "ScalingMax", "Vector3D", "Vector", "",1,1,1')
-            out.append('\t\t\t\tP: "GeometricTranslation", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "GeometricRotation", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "GeometricScaling", "Vector3D", "Vector", "",1,1,1')
-            out.append('\t\t\t\tP: "Lcl Translation", "Lcl Translation", "", "A",0,0,0')
-            out.append('\t\t\t\tP: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,0')
-            out.append('\t\t\t\tP: "Lcl Scaling", "Lcl Scaling", "", "A",1,1,1')
-            out.append('\t\t\t\tP: "Visibility", "Visibility", "", "A",1')
-            out.append("\t\t\t}")
-            out.append("\t\t}")
-            out.append("\t}")
-        if self.type_counts.get("Geometry", 0) > 0:
-            out.append('\tObjectType: "Geometry" {')
-            out.append(f"\t\tCount: {self.type_counts['Geometry']}")
-            out.append('\t\tPropertyTemplate: "FbxMesh" {')
-            out.append("\t\t\tProperties70:  {")
-            out.append('\t\t\t\tP: "Color", "ColorRGB", "Color", "",0.8,0.8,0.8')
-            out.append('\t\t\t\tP: "BBoxMin", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "BBoxMax", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "Primary Visibility", "bool", "", "",1')
-            out.append('\t\t\t\tP: "Casts Shadows", "bool", "", "",1')
-            out.append('\t\t\t\tP: "Receive Shadows", "bool", "", "",1')
-            out.append("\t\t\t}")
-            out.append("\t\t}")
-            out.append("\t}")
-        if self.type_counts.get("Material", 0) > 0:
-            out.append('\tObjectType: "Material" {')
-            out.append(f"\t\tCount: {self.type_counts['Material']}")
-            out.append('\t\tPropertyTemplate: "FbxSurfacePhong" {')
-            out.append("\t\t\tProperties70:  {")
-            out.append('\t\t\t\tP: "ShadingModel", "KString", "", "", "phong"')
-            out.append('\t\t\t\tP: "MultiLayer", "bool", "", "",0')
-            out.append('\t\t\t\tP: "EmissiveColor", "Color", "", "A",0,0,0')
-            out.append('\t\t\t\tP: "EmissiveFactor", "Number", "", "A",1')
-            out.append('\t\t\t\tP: "AmbientColor", "Color", "", "A",0.2,0.2,0.2')
-            out.append('\t\t\t\tP: "AmbientFactor", "Number", "", "A",1')
-            out.append('\t\t\t\tP: "DiffuseColor", "Color", "", "A",0.8,0.8,0.8')
-            out.append('\t\t\t\tP: "DiffuseFactor", "Number", "", "A",1')
-            out.append('\t\t\t\tP: "Bump", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "NormalMap", "Vector3D", "Vector", "",0,0,0')
-            out.append('\t\t\t\tP: "BumpFactor", "double", "Number", "",1')
-            out.append('\t\t\t\tP: "TransparentColor", "Color", "", "A",0,0,0')
-            out.append('\t\t\t\tP: "TransparencyFactor", "Number", "", "A",0')
-            out.append('\t\t\t\tP: "SpecularColor", "Color", "", "A",0.2,0.2,0.2')
-            out.append('\t\t\t\tP: "SpecularFactor", "Number", "", "A",1')
-            out.append('\t\t\t\tP: "ShininessExponent", "Number", "", "A",20')
-            out.append('\t\t\t\tP: "ReflectionColor", "Color", "", "A",0,0,0')
-            out.append('\t\t\t\tP: "ReflectionFactor", "Number", "", "A",1')
-            out.append("\t\t\t}")
-            out.append("\t\t}")
-            out.append("\t}")
-        if self.type_counts.get("Texture", 0) > 0:
-            out.append('\tObjectType: "Texture" {')
-            out.append(f"\t\tCount: {self.type_counts['Texture']}")
-            out.append("\t}")
-        if self.type_counts.get("Video", 0) > 0:
-            out.append('\tObjectType: "Video" {')
-            out.append(f"\t\tCount: {self.type_counts['Video']}")
-            out.append("\t}")
-        if self.type_counts.get("Deformer", 0) > 0:
-            out.append('\tObjectType: "Deformer" {')
-            out.append(f"\t\tCount: {self.type_counts['Deformer']}")
-            out.append("\t}")
-        if self.type_counts.get("SubDeformer", 0) > 0:
-            out.append('\tObjectType: "SubDeformer" {')
-            out.append(f"\t\tCount: {self.type_counts['SubDeformer']}")
-            out.append("\t}")
-        if self.type_counts.get("Pose", 0) > 0:
-            out.append('\tObjectType: "Pose" {')
-            out.append(f"\t\tCount: {self.type_counts['Pose']}")
-            out.append("\t}")
-        out.append("}")
-        out.append("")
+# ---------------------------------------------------------------------------
+# Property templates (referenced by build_definitions)
+# ---------------------------------------------------------------------------
 
-        # Objects
-        out.append("Objects:  {")
-        out.append("\n".join(self.objects))
-        out.append("}")
-        out.append("")
+_MODEL_PROPS_TEMPLATE: List[Tuple[Any, ...]] = [
+    (("S", "QuaternionInterpolate"), ("S", "bool"), ("S", ""), ("S", ""), ("C", False)),
+    (("S", "RotationOffset"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "RotationPivot"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "ScalingOffset"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "ScalingPivot"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "TranslationActive"), ("S", "bool"), ("S", ""), ("S", ""), ("C", False)),
+    (("S", "TranslationMin"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "TranslationMax"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "RotationOrder"), ("S", "enum"), ("S", ""), ("S", ""), ("I", 0)),
+    (("S", "RotationSpaceForLimitOnly"), ("S", "bool"), ("S", ""), ("S", ""), ("C", False)),
+    (("S", "RotationStiffnessX"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "RotationStiffnessY"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "RotationStiffnessZ"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "AxisLen"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 10.0)),
+    (("S", "PreRotation"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "PostRotation"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "RotationActive"), ("S", "bool"), ("S", ""), ("S", ""), ("C", False)),
+    (("S", "RotationMin"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "RotationMax"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "InheritType"), ("S", "enum"), ("S", ""), ("S", ""), ("I", 0)),
+    (("S", "ScalingActive"), ("S", "bool"), ("S", ""), ("S", ""), ("C", False)),
+    (("S", "ScalingMin"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "ScalingMax"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 1.0), ("D", 1.0), ("D", 1.0)),
+    (("S", "GeometricTranslation"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "GeometricRotation"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "GeometricScaling"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 1.0), ("D", 1.0), ("D", 1.0)),
+    (("S", "MinDampRangeX"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "MinDampRangeY"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "MinDampRangeZ"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "MaxDampRangeX"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "MaxDampRangeY"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "MaxDampRangeZ"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "MinDampStrengthX"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "MinDampStrengthY"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "MinDampStrengthZ"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "MaxDampStrengthX"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "MaxDampStrengthY"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "MaxDampStrengthZ"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "PreferedAngleX"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "PreferedAngleY"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "PreferedAngleZ"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "LookAtProperty"), ("S", "object"), ("S", ""), ("S", "")),
+    (("S", "UpVectorProperty"), ("S", "object"), ("S", ""), ("S", "")),
+    (("S", "Show"), ("S", "bool"), ("S", ""), ("S", ""), ("C", True)),
+    (("S", "NegativePercentShapeSupport"), ("S", "bool"), ("S", ""), ("S", ""), ("C", True)),
+    (("S", "DefaultAttributeIndex"), ("S", "int"), ("S", "Integer"), ("S", ""), ("I", -1)),
+    (("S", "Freeze"), ("S", "bool"), ("S", ""), ("S", ""), ("C", False)),
+    (("S", "LODBox"), ("S", "bool"), ("S", ""), ("S", ""), ("C", False)),
+    (("S", "Visibility"), ("S", "Visibility"), ("S", ""), ("S", "A"), ("D", 1.0)),
+    (("S", "Lcl Translation"), ("S", "Lcl Translation"), ("S", ""), ("S", "A"), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "Lcl Rotation"), ("S", "Lcl Rotation"), ("S", ""), ("S", "A"), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "Lcl Scaling"), ("S", "Lcl Scaling"), ("S", ""), ("S", "A"), ("D", 1.0), ("D", 1.0), ("D", 1.0)),
+]
 
-        # Connections
-        out.append("Connections:  {")
-        for c in self.connections:
-            out.append(c)
-        out.append("}")
-        out.append("")
+_MATERIAL_PROPS_TEMPLATE: List[Tuple[Any, ...]] = [
+    (("S", "ShadingModel"), ("S", "KString"), ("S", ""), ("S", ""), ("S", "phong")),
+    (("S", "MultiLayer"), ("S", "bool"), ("S", ""), ("S", ""), ("C", False)),
+    (("S", "EmissiveColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "EmissiveFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)),
+    (("S", "AmbientColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", 0.2), ("D", 0.2), ("D", 0.2)),
+    (("S", "AmbientFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)),
+    (("S", "DiffuseColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", 0.8), ("D", 0.8), ("D", 0.8)),
+    (("S", "DiffuseFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)),
+    (("S", "Bump"), ("S", "Vector3D"), ("S", "Vector"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "BumpFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)),
+    (("S", "TransparentColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", 1.0), ("D", 1.0), ("D", 1.0)),
+    (("S", "TransparencyFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 0.0)),
+    (("S", "SpecularColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", 0.2), ("D", 0.2), ("D", 0.2)),
+    (("S", "SpecularFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)),
+    (("S", "ShininessExponent"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 20.0)),
+    (("S", "ReflectionColor"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", 0.0), ("D", 0.0), ("D", 0.0)),
+    (("S", "ReflectionFactor"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)),
+]
 
-        # BindPose connection to document
-        # (Pose objects are connected to the document via OO, but that's optional.)
-        out.append("Takes:  {")
-        out.append('\tCurrent: ""')
-        out.append("}")
-        out.append("")
 
-        return "\n".join(out)
+# ---------------------------------------------------------------------------
+# Conversion options and bone-info dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ConversionOptions:
+    """Options controlling PMX -> FBX conversion."""
+    scale: float = 8.0  # 1 PMX unit = N cm
+    copy_textures: bool = True  # also copy texture files next to FBX
+    emit_morphs: bool = True  # emit blend shapes for vertex morphs
+    emit_bind_pose: bool = True  # emit a BindPose object
+    embed_textures: bool = True  # embed texture bytes inside FBX binary
+    max_bones_per_vertex: int = 4  # cap (UE4 default GPU skinning)
+    texture_subdir: str = "textures"
+    synthetic_root_name: str = "Root"  # synthetic root bone for multi-root PMX
+
+
+@dataclass
+class _BoneInfo:
+    """Per-bone computed info for FBX emission."""
+    pmx_index: int
+    name: str  # sanitized unique name
+    parent_pmx_index: int  # -1 if none (or synthetic root)
+    parent_fbx_index: int  # index into bone_infos (after synthetic root injection); -1 for top
+    fbx_model_id: int  # the Model object id assigned by _FBXFile
+    local_translation: Vec3  # in UE space, scaled
+    world_translation: Vec3  # in UE space, scaled
+    transform_link: Mat4  # world bind matrix for skinning
+
+
+def _sanitize_name(name: str, fallback: str, used: set) -> str:
+    """Return a name safe for FBX: non-empty, unique within `used`.
+    FBX object long names (Model::xxx) tolerate most Unicode but we strip
+    a few problematic characters and ensure uniqueness."""
+    base = name.strip() if name else ""
+    if not base:
+        base = fallback
+    # Replace characters that confuse FBX/UE
+    cleaned_chars = []
+    for ch in base:
+        if ch in ("\x00", "\n", "\r", "\t"):
+            continue
+        if ch in ('"',):
+            cleaned_chars.append("_")
+        else:
+            cleaned_chars.append(ch)
+    cleaned = "".join(cleaned_chars).strip()
+    if not cleaned:
+        cleaned = fallback
+    candidate = cleaned
+    i = 1
+    while candidate in used:
+        i += 1
+        candidate = f"{cleaned}_{i}"
+    used.add(candidate)
+    return candidate
+
+
+def _build_bone_info(
+    model: PMXModel,
+    options: ConversionOptions,
+    used_names: set,
+) -> Tuple[List[_BoneInfo], int]:
+    """Build the bone list for FBX emission.
+
+    Detects roots (PMX parent == -1). If there is more than one root or zero
+    roots, injects a synthetic "Root" bone at the world origin (after the
+    PMX->UE coordinate conversion) so UE has a single skeletal root.
+
+    Returns:
+      (bone_infos, synthetic_root_index)
+      bone_infos is a list in PMX bone order, except that when a synthetic
+      root is injected it is inserted at index 0 and all real bones follow
+      (with their parent_fbx_index shifted accordingly).
+      synthetic_root_index is the index in bone_infos of the synthetic root,
+      or -1 if none was created.
+    """
+    scale = options.scale
+    n = len(model.bones)
+
+    # Compute world position (UE space) for every PMX bone
+    world_pos: List[Vec3] = []
+    for b in model.bones:
+        ue = permute(b.position)
+        world_pos.append((ue[0] * scale, ue[1] * scale, ue[2] * scale))
+
+    # Identify PMX root bones (parent_bone == -1)
+    pmx_roots = [i for i, b in enumerate(model.bones) if b.parent_bone < 0 or b.parent_bone >= n]
+
+    inject_synthetic = len(pmx_roots) != 1
+    synthetic_root_index = -1
+
+    bone_infos: List[_BoneInfo] = []
+
+    if inject_synthetic:
+        # Synthetic root at world origin
+        synthetic_root_index = 0
+        root_name = _sanitize_name(options.synthetic_root_name, "Root", used_names)
+        bone_infos.append(_BoneInfo(
+            pmx_index=-1,
+            name=root_name,
+            parent_pmx_index=-1,
+            parent_fbx_index=-1,
+            fbx_model_id=0,
+            local_translation=(0.0, 0.0, 0.0),
+            world_translation=(0.0, 0.0, 0.0),
+            transform_link=mat4_identity(),
+        ))
+
+    # Map pmx_index -> bone_infos index (for parent lookup)
+    pmx_to_info: Dict[int, int] = {}
+    for i in range(n):
+        info_idx = len(bone_infos)
+        pmx_to_info[i] = info_idx
+        bone_infos.append(_BoneInfo(
+            pmx_index=i,
+            name="",  # filled below
+            parent_pmx_index=model.bones[i].parent_bone,
+            parent_fbx_index=-1,  # filled below
+            fbx_model_id=0,
+            local_translation=(0.0, 0.0, 0.0),
+            world_translation=world_pos[i],
+            transform_link=mat4_identity(),
+        ))
+
+    # Fill names
+    for i in range(n):
+        info_idx = pmx_to_info[i]
+        b = model.bones[i]
+        name_src = b.name_en if b.name_en else b.name_jp
+        bone_infos[info_idx].name = _sanitize_name(name_src, f"Bone_{i}", used_names)
+
+    # Fill parent_fbx_index
+    for i in range(n):
+        info_idx = pmx_to_info[i]
+        parent_pmx = model.bones[i].parent_bone
+        if parent_pmx < 0 or parent_pmx >= n:
+            bone_infos[info_idx].parent_fbx_index = synthetic_root_index  # -1 if no synth, else 0
+        else:
+            bone_infos[info_idx].parent_fbx_index = pmx_to_info[parent_pmx]
+
+    # Fill local_translation relative to parent (in UE space)
+    for i in range(n):
+        info_idx = pmx_to_info[i]
+        info = bone_infos[info_idx]
+        if info.parent_fbx_index < 0:
+            parent_world = (0.0, 0.0, 0.0)
+        else:
+            parent_world = bone_infos[info.parent_fbx_index].world_translation
+        info.local_translation = v_sub(info.world_translation, parent_world)
+
+    # Fill transform_link (world bind matrix = translation to world_pos)
+    for info in bone_infos:
+        info.transform_link = mat4_translation(info.world_translation)
+
+    return bone_infos, synthetic_root_index
+
+
+def _build_clusters(
+    vertices: List[PMXVertex],
+    bone_infos: List[_BoneInfo],
+    pmx_to_info: Dict[int, int],
+    max_bones_per_vertex: int,
+) -> Dict[int, List[Tuple[int, float]]]:
+    """Aggregate per-bone vertex assignments.
+
+    For each vertex, sum weights of duplicate bones, keep only the top
+    `max_bones_per_vertex`, renormalize, and group by bone.
+
+    Args:
+      vertices: PMX vertices.
+      bone_infos: bone info list (index = info index).
+      pmx_to_info: maps PMX bone index -> bone_infos index.
+      max_bones_per_vertex: cap.
+
+    Returns:
+      Dict mapping bone_infos_index -> list of (vertex_index, weight).
+    """
+    clusters: Dict[int, List[Tuple[int, float]]] = {i: [] for i in range(len(bone_infos))}
+
+    for vi, vtx in enumerate(vertices):
+        # Sum duplicate bone weights
+        per_bone: Dict[int, float] = {}
+        for bidx, w in zip(vtx.bones, vtx.weights):
+            if bidx < 0:
+                continue
+            info_idx = pmx_to_info.get(bidx)
+            if info_idx is None:
+                continue
+            per_bone[info_idx] = per_bone.get(info_idx, 0.0) + float(w)
+
+        if not per_bone:
+            continue
+
+        # Keep top N
+        items = sorted(per_bone.items(), key=lambda kv: kv[1], reverse=True)
+        if len(items) > max_bones_per_vertex:
+            items = items[:max_bones_per_vertex]
+
+        # Renormalize
+        total = sum(w for _, w in items)
+        if total <= 0.0:
+            continue
+        for info_idx, w in items:
+            clusters[info_idx].append((vi, w / total))
+
+    # Drop empty clusters
+    return {k: v for k, v in clusters.items() if v}
 
 
 # ---------------------------------------------------------------------------
@@ -917,417 +1119,276 @@ class _FBXFile:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class ConversionOptions:
-    scale: float = 8.0  # 1 PMX unit = 8 cm (default); 1 UE unit = 1 cm
-    flip_uv_v: bool = True  # PMX V=0 top, UE V=0 bottom
-    flip_winding: bool = True  # PMX CW -> FBX CCW
-    copy_textures: bool = True  # copy textures next to FBX
-    texture_subdir: str = "textures"  # subdir name next to FBX for copied textures
-    emit_morphs: bool = True
-    emit_bind_pose: bool = True
-    max_bones_per_vertex: int = 4  # UE4 default skinning limit
-    additional_uv_as_channels: bool = True
-
-
-@dataclass
-class _BoneInfo:
-    """Per-bone precomputed data."""
-    pmx_index: int
-    name: str
-    world_pos_pmx: Vec3  # in PMX model space
-    world_pos_ue: Vec3  # in UE space (permuted + scaled)
-    local_pos_ue: Vec3  # relative to parent (UE space)
-    parent_pmx: int
-    is_root: bool
-    fbx_id: int = 0
-    transform_link: Mat4 = field(default_factory=mat4_identity)
-
-
-def _sanitize_name(name: str, fallback: str) -> str:
-    """Make a name safe for FBX/UE. Strip control chars, keep unicode."""
-    if not name:
-        return fallback
-    cleaned = []
-    for ch in name:
-        if ord(ch) < 32:
-            continue
-        if ch in ('"', "\\"):
-            cleaned.append("_")
-        else:
-            cleaned.append(ch)
-    s = "".join(cleaned).strip()
-    return s if s else fallback
-
-
-def _build_bone_info(model: PMXModel, options: ConversionOptions) -> List[_BoneInfo]:
-    """Precompute bone world/local positions and detect roots."""
-    bones: List[_BoneInfo] = []
-    for i, b in enumerate(model.bones):
-        world_pmx = b.position
-        world_ue = v_scale(permute(world_pmx), options.scale)
-        is_root = b.parent_bone < 0 or b.parent_bone >= len(model.bones)
-        parent_pmx = -1 if is_root else b.parent_bone
-        bones.append(
-            _BoneInfo(
-                pmx_index=i,
-                name=_sanitize_name(b.name_en or b.name_jp, f"Bone_{i}"),
-                world_pos_pmx=world_pmx,
-                world_pos_ue=world_ue,
-                local_pos_ue=(0.0, 0.0, 0.0),  # filled below
-                parent_pmx=parent_pmx,
-                is_root=is_root,
-            )
-        )
-    # Compute local positions (relative to parent in UE space)
-    for bi in bones:
-        if bi.is_root or bi.parent_pmx < 0:
-            bi.local_pos_ue = bi.world_pos_ue
-        else:
-            parent = bones[bi.parent_pmx]
-            bi.local_pos_ue = v_sub(bi.world_pos_ue, parent.world_pos_ue)
-    return bones
-
-
-def _build_clusters(
-    model: PMXModel, bones: List[_BoneInfo], options: ConversionOptions
-) -> Dict[int, Tuple[List[int], List[float]]]:
-    """For each bone, collect (vertex_index, weight) pairs it influences.
-
-    - If a vertex lists the same bone multiple times (common in BDEF4 when the
-      author duplicated a bone slot), the weights are summed.
-    - Caps influences at max_bones_per_vertex per vertex by keeping the top-N
-      weighted bones and renormalizing.
-    """
-    # First, collect and sum all influences per vertex (bone -> total weight)
-    per_vertex: List[Dict[int, float]] = [{} for _ in range(len(model.vertices))]
-    for vi, v in enumerate(model.vertices):
-        for bi, w in zip(v.bones, v.weights):
-            if 0 <= bi < len(bones) and w > 0.0:
-                per_vertex[vi][bi] = per_vertex[vi].get(bi, 0.0) + w
-
-    # Convert to sorted lists, cap to max bones per vertex, renormalize
-    per_vertex_list: List[List[Tuple[int, float]]] = []
-    for influences in per_vertex:
-        items = sorted(influences.items(), key=lambda x: -x[1])
-        if len(items) > options.max_bones_per_vertex:
-            items = items[: options.max_bones_per_vertex]
-        total = sum(w for _, w in items)
-        if total > 0.0:
-            items = [(bi, w / total) for bi, w in items]
-        per_vertex_list.append(items)
-
-    # Group by bone
-    clusters: Dict[int, Tuple[List[int], List[float]]] = {}
-    for vi, influences in enumerate(per_vertex_list):
-        for bi, w in influences:
-            if bi not in clusters:
-                clusters[bi] = ([], [])
-            clusters[bi][0].append(vi)
-            clusters[bi][1].append(w)
-    return clusters
-
-
-def _compute_transform_link(bone: _BoneInfo) -> Mat4:
-    """TransformLink = bone's bind-pose world matrix. For PMX bones (translation
-    only, identity rotation/scale), this is just translation by world_pos_ue."""
-    return mat4_translation(bone.world_pos_ue)
-
-
 def write_fbx(
     model: PMXModel,
     out_path: str,
     options: Optional[ConversionOptions] = None,
+    texture_bytes: Optional[Dict[int, bytes]] = None,
     log=print,
 ) -> str:
-    """Convert a PMXModel to an FBX 7.4.0 ASCII file.
+    """Convert a parsed PMXModel to an FBX 7.4.0 binary file.
 
     Args:
-      model: parsed PMX model
-      out_path: absolute path to write the .fbx file
-      options: conversion options (defaults to scale=8.0)
-      log: callable for progress messages
+      model: parsed PMX model.
+      out_path: absolute path to write the .fbx file.
+      options: ConversionOptions (defaults if None).
+      texture_bytes: optional map of texture_index -> raw image bytes, for
+        embedding. When present and options.embed_textures is True, the bytes
+        are written into Video.Content.
+      log: progress logger.
 
     Returns:
-      The path that was written.
+      The absolute path written.
     """
     if options is None:
         options = ConversionOptions()
+    if texture_bytes is None:
+        texture_bytes = {}
 
-    log(f"Building FBX structure for {model.name_en or model.name_jp!r}...")
-    log(
-        f"  vertices={len(model.vertices)} faces={len(model.faces)//3} "
-        f"materials={len(model.materials)} bones={len(model.bones)} "
-        f"morphs={len(model.morphs)} textures={len(model.textures)}"
-    )
+    scale = options.scale
+    out_path = os.path.abspath(out_path)
+    model_name = model.name_en or model.name_jp or "PMXModel"
+    used_names: set = set()
 
     fbx = _FBXFile()
-    out_dir = os.path.dirname(os.path.abspath(out_path))
-    out_base = os.path.splitext(os.path.basename(out_path))[0]
 
-    # --- Bones ---
-    bones = _build_bone_info(model, options)
-    log(f"  bones: {len(bones)} total, {sum(1 for b in bones if b.is_root)} root(s)")
+    # ---- Bones ----
+    log(f"  bones: {len(model.bones)} (building hierarchy)")
+    bone_infos, synth_root_idx = _build_bone_info(model, options, used_names)
+    pmx_to_info: Dict[int, int] = {}
+    for idx, info in enumerate(bone_infos):
+        if info.pmx_index >= 0:
+            pmx_to_info[info.pmx_index] = idx
 
-    # Detect multiple roots - if so, add a synthetic root bone
-    roots = [b for b in bones if b.is_root]
-    synthetic_root_id: Optional[int] = None
-    if len(roots) > 1:
-        # Create synthetic root at origin (UE space)
-        synthetic_root_name = "___Root"
-        synthetic_root_id = fbx.add_model_bone(synthetic_root_name, (0.0, 0.0, 0.0))
-        log(f"  created synthetic root bone (multiple roots detected)")
+    # ---- Mesh Model ----
+    mesh_name = _sanitize_name(model_name, "Mesh", used_names)
+    mesh_model_id = fbx.add_model_mesh(mesh_name, translation=(0.0, 0.0, 0.0))
 
-    # Create FBX Model nodes for each bone
-    for bi in bones:
-        bi.fbx_id = fbx.add_model_bone(bi.name, bi.local_pos_ue)
-        bi.transform_link = _compute_transform_link(bi)
+    # ---- Bone Models ----
+    # Emit in bone_infos order so parents precede children (synthetic root
+    # is first, then PMX bones in their original order).
+    for info in bone_infos:
+        info.fbx_model_id = fbx.add_model_bone(
+            info.name,
+            translation=info.local_translation,
+        )
 
-    # Connect bone hierarchy
-    for bi in bones:
-        if bi.is_root:
-            if synthetic_root_id is not None:
-                fbx.connect_oo(bi.fbx_id, synthetic_root_id)
-            else:
-                fbx.connect_oo(bi.fbx_id, 0)  # parent to scene root
-        else:
-            parent = bones[bi.parent_pmx]
-            fbx.connect_oo(bi.fbx_id, parent.fbx_id)
-    if synthetic_root_id is not None:
-        fbx.connect_oo(synthetic_root_id, 0)
+    # Connect bone hierarchy (OO child -> parent)
+    for info in bone_infos:
+        if info.parent_fbx_index >= 0:
+            parent_id = bone_infos[info.parent_fbx_index].fbx_model_id
+            fbx.connect_oo(info.fbx_model_id, parent_id)
 
-    # Determine which bone the mesh is parented to. UE4 expects the mesh to be
-    # parented to the root bone (synthetic or first root).
-    if synthetic_root_id is not None:
-        mesh_parent_id = synthetic_root_id
-    elif roots:
-        mesh_parent_id = roots[0].fbx_id
-    else:
-        mesh_parent_id = 0
+    # If a synthetic root exists, connect the mesh to it; otherwise connect
+    # the mesh to the single PMX root bone.
+    if synth_root_idx >= 0:
+        fbx.connect_oo(mesh_model_id, bone_infos[synth_root_idx].fbx_model_id)
+    elif bone_infos:
+        # find the root (parent_fbx_index == -1)
+        root_id = next(b.fbx_model_id for b in bone_infos if b.parent_fbx_index < 0)
+        fbx.connect_oo(mesh_model_id, root_id)
 
-    # --- Mesh Model ---
-    mesh_name = _sanitize_name(model.name_en or model.name_jp, out_base or "Mesh")
-    mesh_model_id = fbx.add_model_mesh(mesh_name, (0.0, 0.0, 0.0))
-    fbx.connect_oo(mesh_model_id, mesh_parent_id)
+    # ---- Geometry: vertices, faces, normals, UVs ----
+    log(f"  geometry: {len(model.vertices)} verts, {len(model.faces)//3} tris")
+    verts_ue: List[Vec3] = []
+    for v in model.vertices:
+        p = permute(v.position)
+        verts_ue.append((p[0] * scale, p[1] * scale, p[2] * scale))
 
-    # --- Geometry ---
-    # Build control points (vertices) in UE space
-    vertices_ue: List[Vec3] = [v_scale(permute(v.position), options.scale) for v in model.vertices]
-
-    # Build faces: PMX CW -> FBX CCW. Flip winding by swapping v1 and v2.
+    # Faces: PMX flat list -> list of (a,b,c). Flip winding for UE (CCW).
     faces: List[Tuple[int, int, int]] = []
     for i in range(0, len(model.faces), 3):
-        v0 = model.faces[i]
-        v1 = model.faces[i + 1]
-        v2 = model.faces[i + 2]
-        if options.flip_winding:
-            faces.append((v0, v2, v1))
-        else:
-            faces.append((v0, v1, v2))
+        a = model.faces[i]
+        b = model.faces[i + 1]
+        c = model.faces[i + 2]
+        faces.append((a, c, b))  # flip b<->c
 
-    # Build per-corner normals in UE space (permute, but do NOT scale)
+    # Normals: permute (no flip; winding flip handles facing)
     normals_ue: List[Vec3] = []
-    # Faces are triangles; for each corner we need the vertex's normal.
-    # PMX stores per-vertex normals; we just expand per corner.
-    # (PMX normals are normalized; we keep them normalized.)
-    for (v0, v1, v2) in faces:
-        for vi in (v0, v1, v2):
-            n = model.vertices[vi].normal
-            normals_ue.append(permute(n))
+    for v in model.vertices:
+        normals_ue.append(permute(v.normal))
 
-    # Build UVs. PMX V=0 is top; UE V=0 is bottom. Flip V.
-    # Use IndexToDirect: unique UVs indexed per corner. Most MMD models have
-    # per-vertex UVs (so UV index = vertex index), but to be safe we dedupe.
-    uvs_unique: List[Tuple[float, float]] = []
-    uv_map: Dict[Tuple[float, float], int] = {}
-    uv_indices: List[int] = []
-    for (v0, v1, v2) in faces:
-        for vi in (v0, v1, v2):
-            u, v = model.vertices[vi].uv
-            if options.flip_uv_v:
-                v = 1.0 - v
-            key = (u, v)
-            idx = uv_map.get(key)
-            if idx is None:
-                idx = len(uvs_unique)
-                uv_map[key] = idx
-                uvs_unique.append((u, v))
-            uv_indices.append(idx)
+    # UVs: V-flip; one UV per vertex (PMX has unique vertices)
+    uvs: List[Tuple[float, float]] = []
+    for v in model.vertices:
+        uvs.append((v.uv[0], 1.0 - v.uv[1]))
+    uv_indices: List[int] = [idx for tri in faces for idx in tri]
 
-    # Additional UVs as extra UV channels (per control point, 2 components used)
-    additional_uvs_layers: Optional[List[List[Tuple[float, float, float, float]]]] = None
-    if options.additional_uv_as_channels and model.additional_uv_count > 0:
-        additional_uvs_layers = []
-        for layer_idx in range(model.additional_uv_count):
-            layer = [v.additional_uvs[layer_idx] for v in model.vertices]
-            additional_uvs_layers.append(layer)
+    # Additional UV layers
+    additional_uvs: Optional[List[List[Tuple[float, float, float, float]]]] = None
+    if model.additional_uv_count > 0:
+        additional_uvs = []
+        for layer in range(model.additional_uv_count):
+            layer_uvs = [v.additional_uvs[layer] for v in model.vertices]
+            additional_uvs.append(layer_uvs)
 
-    # Material per face: PMX materials are contiguous blocks of face_count/3
-    # triangles each. Compute the slot index per face.
-    material_per_face: Optional[List[int]] = None
-    if len(model.materials) > 1:
-        material_per_face = []
-        slot = 0
-        remaining = model.materials[0].face_count // 3 if model.materials else 0
-        for face_idx in range(len(faces)):
-            while remaining <= 0 and slot < len(model.materials) - 1:
-                slot += 1
-                remaining = model.materials[slot].face_count // 3
-            material_per_face.append(slot)
-            remaining -= 1
-    elif len(model.materials) == 1:
-        material_per_face = None  # AllSame is more efficient
-    else:
-        material_per_face = None  # no materials
+    # Material per face
+    material_per_face: List[int] = []
+    for mat_idx, mat in enumerate(model.materials):
+        tri_count = mat.face_count // 3
+        material_per_face.extend([mat_idx] * tri_count)
 
-    # Shape blocks for vertex morphs
+    # Shape blocks (vertex morphs -> blend shapes)
     shape_blocks: List[Tuple[str, List[int], List[Vec3]]] = []
     if options.emit_morphs:
         for morph in model.morphs:
             if morph.morph_type != 1:  # only vertex morphs
                 continue
-            mname = _sanitize_name(morph.name_en or morph.name_jp, "Morph")
             indices: List[int] = []
             deltas: List[Vec3] = []
-            for o in morph.offsets:
-                if o.vertex_index < 0 or o.vertex_index >= len(model.vertices):
+            for off in morph.offsets:
+                if off.vertex_index < 0 or off.vertex_index >= len(model.vertices):
                     continue
-                indices.append(o.vertex_index)
-                # Delta is in PMX space; permute to UE space and apply scale
-                d_ue = v_scale(permute(o.translation), options.scale)
-                deltas.append(d_ue)
+                d = permute(off.translation)
+                indices.append(off.vertex_index)
+                deltas.append((d[0] * scale, d[1] * scale, d[2] * scale))
             if indices:
+                mname = _sanitize_name(
+                    morph.name_en or morph.name_jp,
+                    f"Morph_{len(shape_blocks)}",
+                    used_names,
+                )
                 shape_blocks.append((mname, indices, deltas))
-        if shape_blocks:
-            log(f"  morphs: {len(shape_blocks)} vertex morph(s) -> blend shapes")
 
-    geometry_id = fbx.add_geometry(
+    geom_id = fbx.add_geometry(
         mesh_name,
-        vertices_ue,
+        verts_ue,
         faces,
         normals_ue,
-        uvs_unique,
+        uvs,
         uv_indices,
-        additional_uvs=additional_uvs_layers,
-        material_per_face=material_per_face,
+        additional_uvs=additional_uvs,
+        material_per_face=material_per_face if material_per_face else None,
         shape_blocks=shape_blocks if shape_blocks else None,
     )
-    fbx.connect_oo(geometry_id, mesh_model_id)
+    # Connect geometry OO to mesh model
+    fbx.connect_oo(geom_id, mesh_model_id)
 
-    # --- Materials ---
-    material_ids: List[int] = []
+    # ---- Materials ----
+    log(f"  materials: {len(model.materials)}")
+    mat_fbx_ids: List[int] = []
     for mi, mat in enumerate(model.materials):
-        mname = _sanitize_name(mat.name_en or mat.name_jp, f"Mat_{mi}")
-        # PMX diffuse RGB is in 0..1 linear-ish; pass through.
-        # Emissive: PMX doesn't have emissive directly; use 0.
+        mname = _sanitize_name(
+            mat.name_en or mat.name_jp,
+            f"Material_{mi}",
+            used_names,
+        )
+        # PMX diffuse is RGBA; FBX DiffuseColor is RGB + TransparencyFactor
+        opacity = mat.diffuse[3]
         mid = fbx.add_material(
             mname,
-            diffuse=mat.diffuse,
+            diffuse=(mat.diffuse[0], mat.diffuse[1], mat.diffuse[2], mat.diffuse[3]),
             specular=mat.specular,
             specular_strength=mat.specular_strength,
             ambient=mat.ambient,
             emissive=(0.0, 0.0, 0.0),
-            opacity=mat.diffuse[3],
+            opacity=opacity,
         )
-        material_ids.append(mid)
+        mat_fbx_ids.append(mid)
         fbx.connect_oo(mid, mesh_model_id)
 
-    # --- Textures ---
-    # The texture table entries are taken as-is for the FBX RelativeFilename.
-    # The convert.py orchestrator is responsible for copying textures next to
-    # the FBX and updating model.textures[ti] to the appropriate relative path
-    # (e.g. "textures/foo.png"). If the table entry still points to an
-    # absolute or PMX-relative path, we just normalize separators.
-    texture_fbx_ids: Dict[int, Tuple[int, int]] = {}  # tex_index -> (tex_id, vid_id)
-    for ti, tex_path in enumerate(model.textures):
-        # Use the texture table entry directly as the relative filename. We
-        # normalize backslashes to forward slashes (FBX/UE convention) and
-        # strip any leading "./".
-        rel_name = tex_path.replace("\\", "/")
-        if rel_name.startswith("./"):
-            rel_name = rel_name[2:]
-        if not rel_name:
-            rel_name = f"texture_{ti}.png"
-        basename = os.path.basename(rel_name)
-        tex_name = _sanitize_name(os.path.splitext(basename)[0], f"Tex_{ti}")
-        tex_id = fbx.add_texture(tex_name, rel_name)
-        vid_id = fbx.add_video(tex_name, rel_name)
-        fbx.connect_oo(vid_id, tex_id)
-        texture_fbx_ids[ti] = (tex_id, vid_id)
+    # ---- Textures + Videos (with embedded bytes) ----
+    # Collect unique texture indices actually used by materials.
+    used_tex: set = set()
+    for mat in model.materials:
+        if mat.texture_index >= 0:
+            used_tex.add(mat.texture_index)
+        if mat.sphere_index >= 0:
+            used_tex.add(mat.sphere_index)
+        if not mat.toon_shared and mat.toon_index >= 0:
+            used_tex.add(mat.toon_index)
 
-    # Connect textures to materials based on each material's texture/sphere/toon
-    for mi, mat in enumerate(model.materials):
-        if mi >= len(material_ids):
+    log(f"  textures: {len(used_tex)} referenced, embedding={options.embed_textures}")
+    tex_fbx_ids: Dict[int, int] = {}  # tex_index -> Texture object id
+    vid_fbx_ids: Dict[int, int] = {}  # tex_index -> Video object id
+    embedded_count = 0
+    for ti in sorted(used_tex):
+        if ti < 0 or ti >= len(model.textures):
             continue
-        mid = material_ids[mi]
-        # Diffuse texture
-        if 0 <= mat.texture_index < len(model.textures):
-            tex_id, _ = texture_fbx_ids[mat.texture_index]
-            fbx.connect_op(tex_id, mid, "DiffuseColor")
-        # Sphere texture - add as additional DiffuseColor (UE will combine) or
-        # as SpecularColor depending on sphere_mode. We use DiffuseColor for
-        # mul/add modes (visually similar) and SpecularColor for sub-tex mode.
-        if 0 <= mat.sphere_index < len(model.textures):
-            tex_id, _ = texture_fbx_ids[mat.sphere_index]
-            if mat.sphere_mode == 3:
-                fbx.connect_op(tex_id, mid, "SpecularColor")
-            else:
-                # Sphere as a second diffuse texture - UE will pick the first;
-                # for completeness we also connect to EmissiveColor so it shows.
-                fbx.connect_op(tex_id, mid, "EmissiveColor")
-        # Toon texture (if not shared)
-        if not mat.toon_shared and 0 <= mat.toon_index < len(model.textures):
-            tex_id, _ = texture_fbx_ids[mat.toon_index]
-            fbx.connect_op(tex_id, mid, "EmissiveColor")
+        tex_path = model.textures[ti]
+        # Use basename for the texture/video object name and relative filename
+        base = os.path.basename(tex_path.replace("\\", "/"))
+        if not base:
+            base = f"texture_{ti}.png"
+        tname = _sanitize_name(base, f"Texture_{ti}", used_names)
+        # Strip extension for the object name to avoid weirdness
+        tname_stem = os.path.splitext(tname)[0]
 
-    # --- Skinning (Skin Deformer + Clusters) ---
-    if bones:
-        clusters = _build_clusters(model, bones, options)
+        content = texture_bytes.get(ti) if options.embed_textures else None
+        vid_id = fbx.add_video(tname_stem, base, content_bytes=content)
+        tex_id = fbx.add_texture(tname_stem, base)
+        tex_fbx_ids[ti] = tex_id
+        vid_fbx_ids[ti] = vid_id
+        fbx.connect_oo(vid_id, tex_id)
+        if content is not None:
+            embedded_count += 1
+
+    if options.embed_textures:
+        log(f"  embedded {embedded_count} texture(s) into FBX binary")
+
+    # Connect textures to materials per property
+    for mi, mat in enumerate(model.materials):
+        mid = mat_fbx_ids[mi]
+        if mat.texture_index >= 0 and mat.texture_index in tex_fbx_ids:
+            fbx.connect_op(tex_fbx_ids[mat.texture_index], mid, "DiffuseColor")
+        if mat.sphere_index >= 0 and mat.sphere_index in tex_fbx_ids:
+            # Sphere maps are commonly used as specular/rim; route to SpecularColor
+            fbx.connect_op(tex_fbx_ids[mat.sphere_index], mid, "SpecularColor")
+        if not mat.toon_shared and mat.toon_index >= 0 and mat.toon_index in tex_fbx_ids:
+            fbx.connect_op(tex_fbx_ids[mat.toon_index], mid, "EmissiveColor")
+
+    # ---- Skin deformer + clusters ----
+    if bone_infos:
+        log(f"  skinning: building clusters (max {options.max_bones_per_vertex} bones/vert)")
         skin_id = fbx.add_skin_deformer(mesh_name)
-        fbx.connect_oo(skin_id, geometry_id)
-        # Mesh bind transform: identity (mesh Model at origin)
-        mesh_transform = mat4_identity()
-        for bi_idx, bi in enumerate(bones):
-            if bi_idx not in clusters:
-                continue
-            indices, weights = clusters[bi_idx]
-            cluster_id = fbx.add_cluster(
-                bi.name,
+        fbx.connect_oo(skin_id, geom_id)
+
+        clusters = _build_clusters(
+            model.vertices,
+            bone_infos,
+            pmx_to_info,
+            options.max_bones_per_vertex,
+        )
+        # Transform matrix = mesh bind world = identity (mesh at origin)
+        transform = mat4_identity()
+        for info_idx, vw_list in clusters.items():
+            info = bone_infos[info_idx]
+            indices = [vi for vi, _ in vw_list]
+            weights = [w for _, w in vw_list]
+            cid = fbx.add_cluster(
+                info.name,
                 indices,
                 weights,
-                transform=mesh_transform,
-                transform_link=bi.transform_link,
+                transform,
+                info.transform_link,
             )
-            fbx.connect_oo(cluster_id, skin_id)
-            fbx.connect_oo(cluster_id, bi.fbx_id)
-        log(f"  skinning: {len(clusters)} cluster(s)")
+            fbx.connect_oo(cid, skin_id)
+            fbx.connect_op(cid, info.fbx_model_id, "Link")
 
-    # --- BlendShape Deformers ---
+    # ---- Blend shapes (vertex morphs) ----
     if shape_blocks:
+        log(f"  blend shapes: {len(shape_blocks)} channel(s)")
         bs_id = fbx.add_blendshape_deformer(mesh_name)
-        fbx.connect_oo(bs_id, geometry_id)
-        for shape_name, _, _ in shape_blocks:
-            chan_id = fbx.add_blendshape_channel(shape_name)
-            fbx.connect_oo(chan_id, bs_id)
-            # Connect the geometry to the channel (channel finds its shape by name)
-            fbx.connect_oo(geometry_id, chan_id)
+        fbx.connect_oo(bs_id, geom_id)
+        for sb_name, _indices, _deltas in shape_blocks:
+            ch_id = fbx.add_blendshape_channel(sb_name)
+            fbx.connect_oo(ch_id, bs_id)
 
-    # --- BindPose ---
-    if options.emit_bind_pose and bones:
+    # ---- Bind pose ----
+    if options.emit_bind_pose:
+        log("  bind pose: emitting")
         pose_nodes: List[Tuple[int, Mat4]] = []
-        if synthetic_root_id is not None:
-            pose_nodes.append((synthetic_root_id, mat4_identity()))
-        for bi in bones:
-            pose_nodes.append((bi.fbx_id, bi.transform_link))
+        # Mesh node (identity transform at origin)
         pose_nodes.append((mesh_model_id, mat4_identity()))
-        pose_id = fbx.add_bind_pose("BindPose", pose_nodes)
-        # Pose connects to the Document
-        fbx.connect_oo(pose_id, 1000000000)
+        # Bone nodes (their world bind matrices)
+        for info in bone_infos:
+            pose_nodes.append((info.fbx_model_id, info.transform_link))
+        fbx.add_bind_pose(f"Pose::{mesh_name}", pose_nodes)
 
-    # --- Render and write ---
-    log(f"  rendering FBX ASCII...")
-    content = fbx.render(creator="pmx2fbx")
-    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(content)
-    log(f"  wrote {len(content):,} bytes to {out_path}")
+    # ---- Render + write ----
+    log("  serializing FBX binary...")
+    data = fbx.render()
+    with open(out_path, "wb") as fh:
+        fh.write(data)
+    log(f"  wrote {len(data)} bytes -> {out_path}")
     return out_path
