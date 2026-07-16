@@ -332,11 +332,18 @@ class _FBXFile:
             "Deformer": 0,
             "Pose": 0,
         }
-        # Top-level nodes
+        # Top-level nodes (order matches reference FBX files from Blender/Maya):
+        # FBXHeaderExtension, FileId, CreationTime, Creator, GlobalSettings,
+        # Documents, References, Definitions, Objects, Connections, Takes
         self._root = _Node()  # implicit top-level (empty name)
         self._header_ext = self._root.add_child(_Node("FBXHeaderExtension"))
+        # FileId: 16-byte raw identifier (constant used by Blender/Maya reference files)
+        self._root.add_child(_Node("FileId", [("R", bytes.fromhex("28b32aebb624ccc2bfc8b02aa92bfcf1"))]))
+        self._root.add_child(_Node("CreationTime", [("S", "1970-01-01 10:00:00:000")]))
+        self._root.add_child(_Node("Creator", [("S", "pmx2fbx")]))
         self._global_settings = self._root.add_child(_Node("GlobalSettings"))
         self._documents = self._root.add_child(_Node("Documents"))
+        self._references = self._root.add_child(_Node("References"))
         self._definitions = self._root.add_child(_Node("Definitions"))
         self._objects = self._root.add_child(_Node("Objects"))
         self._connections = self._root.add_child(_Node("Connections"))
@@ -834,13 +841,8 @@ class _FBXFile:
         # Build Definitions (must be done after all objects are added)
         self.build_definitions()
 
-        # Takes
-        self._takes.add_child(_Node("Version", [("I", 100)]))
-        tk = self._takes.add_child(_Node("Take"))
-        tk.props = [("S", "Current")]
-        tk.add_child(_Node("FileName", [("S", "")]))
-        tk.add_child(_Node("LocalTime", [("L", 0), ("L", 0)]))
-        tk.add_child(_Node("ReferenceTime", [("L", 0), ("L", 0)]))
+        # Takes (empty — no animation; standard FBX 7.4 format)
+        self._takes.add_child(_Node("Current", [("S", "")]))
 
         # --- Serialize ---
         # The root node is a virtual container; its children are the top-level
@@ -856,13 +858,12 @@ class _FBXFile:
         # NULL record terminates the root (13 bytes for FBX 7.4)
         body.extend(b"\x00" * 13)
 
-        # --- Footer (FBX 7.4 binary, total 160 + padding) ---
-        # Footer1: 16 bytes (can be zeros; parsers skip it)
-        # Padding: 0-15 bytes to align to 16-byte boundary
-        # Footer2: 4 bytes (all 0x00)
-        # Version: 4 bytes (same as header version)
-        # Footer3: 120 bytes (all 0x00)
-        # Footer4: 16 bytes (fixed magic: f85a8c6adef5d97eece90ce3758f290b)
+        # --- Footer (FBX 7.4 binary, 160 bytes + padding) ---
+        # Reference file layout (verified against Blender/Maya output):
+        #   Footer1 (16) -> padding (0-15 zeros) -> Footer2 (4 zeros) -> version (4)
+        #   -> Footer3 (120 zeros) -> Footer4 (16 fixed magic)
+        # ufbx stops parsing at the NULL record and never reads the footer, so the
+        # exact padding does not affect parsing. Layout matches reference files.
         pos_after_null = len(header) + len(body)
         footer1 = b"\x00" * 16
         pos_after_footer1 = pos_after_null + 16

@@ -305,8 +305,8 @@ def _convert_worker(state, log_widget, convert_btn, in_path, out_path) -> None:
         emit_bind_pose=state["emit_bind_pose"].get(),
     )
 
-    def log(msg):
-        log_widget.after(0, lambda: _log(log_widget, msg))
+    def log(msg, tag=""):
+        log_widget.after(0, lambda: _log(log_widget, msg, tag))
 
     try:
         result = convert_pmx_to_fbx(in_path, out_path, options=options, log=log)
