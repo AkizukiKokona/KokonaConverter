@@ -52,17 +52,39 @@ def convert_pmx_to_fbx(
     out_dir = os.path.dirname(out_path)
     os.makedirs(out_dir, exist_ok=True)
 
-    # UE5.x Interchange FBX parser has a known issue with non-ASCII file paths
-    # on Windows (GetFullPathNameA / fopen fail with CJK characters).
-    # Warn the user so they can move the file to an ASCII-only path.
+    # UE5.x Interchange FBX parser uses fopen(char*) on Windows, which encodes
+    # paths using the system ANSI code page (CP932 on Japanese Windows,
+    # CP936/GBK on Chinese Windows). CJK characters that don't exist in the
+    # active code page cause fopen() to fail with "cannot load FBX file".
+    # If the output path contains non-ASCII characters, automatically redirect
+    # to an ASCII-safe filename in the same directory.
+    original_out_path = out_path
     try:
         out_path.encode("ascii")
     except UnicodeEncodeError:
+        # Generate an ASCII-safe output path in the same directory
+        out_dir = os.path.dirname(original_out_path)
+        # Use a fixed ASCII name to avoid any encoding issues
+        ascii_name = "pmx2fbx_output.fbx"
+        ascii_path = os.path.join(out_dir, ascii_name)
+        # If the directory itself contains non-ASCII chars, fall back to a
+        # temp directory near the PMX file's drive root
+        try:
+            ascii_path.encode("ascii")
+        except UnicodeEncodeError:
+            import tempfile
+            # Use a temp dir on the same drive as the PMX file (Windows)
+            # or /tmp on Linux/Mac
+            drive = os.path.splitdrive(pmx_path)[0]
+            temp_base = os.path.join(drive + os.sep, "pmx2fbx_temp") if drive else tempfile.gettempdir()
+            os.makedirs(temp_base, exist_ok=True)
+            ascii_path = os.path.join(temp_base, ascii_name)
+        out_path = os.path.abspath(ascii_path)
         log("")
-        log("⚠ 警告: 输出路径包含非ASCII字符 (中文/日文等)")
-        log("  UE5.x Interchange FBX 解析器在 Windows 上可能无法打开此路径。")
-        log("  建议将 FBX 文件移动到纯英文路径后再导入 UE, 例如:")
-        log("  C:\\Models\\model.fbx")
+        log("⚠ 输出路径包含非ASCII字符，已自动切换到英文路径以兼容 UE5.x:")
+        log(f"  原路径: {original_out_path}")
+        log(f"  新路径: {out_path}")
+        log("  (UE5.x Interchange 的 fopen() 在日文/中文 Windows 上无法处理 CJK 路径)")
         log("")
 
     log(f"Reading PMX: {pmx_path}")
