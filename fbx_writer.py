@@ -328,8 +328,8 @@ class _FBXFile:
             "Material": 0,
             "Texture": 0,
             "Video": 0,
+            "NodeAttribute": 0,
             "Deformer": 0,
-            "SubDeformer": 0,
             "Pose": 0,
         }
         # Top-level nodes
@@ -431,8 +431,8 @@ class _FBXFile:
             ("Material", self.type_counts.get("Material", 0)),
             ("Texture", self.type_counts.get("Texture", 0)),
             ("Video", self.type_counts.get("Video", 0)),
+            ("NodeAttribute", self.type_counts.get("NodeAttribute", 0)),
             ("Deformer", self.type_counts.get("Deformer", 0)),
-            ("SubDeformer", self.type_counts.get("SubDeformer", 0)),
             ("Pose", self.type_counts.get("Pose", 0)),
         ]
         count = sum(1 for _, c in object_types if c > 0)
@@ -473,8 +473,18 @@ class _FBXFile:
             for p in _MATERIAL_PROPS_TEMPLATE:
                 p70.add_child(_Node("P", p))
 
-        # Texture, Video, Deformer, SubDeformer, Pose
-        for tname in ("Texture", "Video", "Deformer", "SubDeformer", "Pose"):
+        # NodeAttribute (LimbNode for bones)
+        if self.type_counts.get("NodeAttribute", 0) > 0:
+            ot = d.add_child(_Node("ObjectType", [("S", "NodeAttribute")]))
+            ot.add_child(_Node("Count", [("I", self.type_counts["NodeAttribute"])]))
+            pt = ot.add_child(_Node("PropertyTemplate", [("S", "FbxSkeleton")]))
+            p70 = pt.add_child(_Node("Properties70"))
+            p70.add_child(_Node("P", [("S", "Color"), ("S", "ColorRGB"), ("S", "Color"), ("S", ""), ("D", 0.8), ("D", 0.8), ("D", 0.8)]))
+            p70.add_child(_Node("P", [("S", "Size"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 100.0)]))
+            p70.add_child(_Node("P", [("S", "LimbLength"), ("S", "double"), ("S", "Number"), ("S", "H"), ("D", 1.0)]))
+
+        # Texture, Video, Deformer, Pose
+        for tname in ("Texture", "Video", "Deformer", "Pose"):
             if self.type_counts.get(tname, 0) > 0:
                 ot = d.add_child(_Node("ObjectType", [("S", tname)]))
                 ot.add_child(_Node("Count", [("I", self.type_counts[tname])]))
@@ -533,7 +543,6 @@ class _FBXFile:
         uv_indices: List[int],
         additional_uvs: Optional[List[List[Tuple[float, float, float, float]]]] = None,
         material_per_face: Optional[List[int]] = None,
-        shape_blocks: Optional[List[Tuple[str, List[int], List[Vec3]]]] = None,
     ) -> int:
         oid = self.id_gen.new()
         self._count("Geometry")
@@ -626,17 +635,6 @@ class _FBXFile:
             le = layer.add_child(_Node("LayerElement"))
             le.add_child(_Node("Type", [("S", "LayerElementUV")]))
             le.add_child(_Node("TypedIndex", [("I", layer_idx)]))
-
-        # Shape blocks (blend shape deltas)
-        if shape_blocks:
-            for shape_name, indices, deltas in shape_blocks:
-                flat_d: List[float] = []
-                for d in deltas:
-                    flat_d.extend(d)
-                shape = obj.add_child(_Node("Shape", [("S", shape_name)]))
-                shape.add_child(_Node("Version", [("I", 100)]))
-                shape.add_child(_Node("Indexes", [("i", indices)]))
-                shape.add_child(_Node("Vectors", [("d", flat_d)]))
 
         self._objects.add_child(obj)
         return oid
@@ -747,8 +745,8 @@ class _FBXFile:
         transform_link: Mat4,
     ) -> int:
         oid = self.id_gen.new()
-        self._count("SubDeformer")
-        obj = _Node("SubDeformer", [("L", oid), ("S", f"SubDeformer::{name}"), ("S", "Cluster")])
+        self._count("Deformer")
+        obj = _Node("Deformer", [("L", oid), ("S", f"SubDeformer::{name}"), ("S", "Cluster")])
         obj.add_child(_Node("Version", [("I", 100)]))
         obj.add_child(_Node("UserData", [("S", ""), ("S", "")]))
         obj.add_child(_Node("Indexes", [("i", indices)]))
@@ -760,11 +758,32 @@ class _FBXFile:
 
     def add_blendshape_channel(self, name: str) -> int:
         oid = self.id_gen.new()
-        self._count("SubDeformer")
-        obj = _Node("SubDeformer", [("L", oid), ("S", f"SubDeformer::{name}"), ("S", "BlendShapeChannel")])
+        self._count("Deformer")
+        obj = _Node("Deformer", [("L", oid), ("S", f"SubDeformer::{name}"), ("S", "BlendShapeChannel")])
         obj.add_child(_Node("Version", [("I", 100)]))
         obj.add_child(_Node("DeformPercent", [("D", 0.0)]))
         obj.add_child(_Node("FullWeights", [("d", [100.0])]))
+        self._objects.add_child(obj)
+        return oid
+
+    def add_shape_geometry(self, name: str, indices: List[int], deltas: List[Vec3]) -> int:
+        """Create a standalone Geometry node of type 'Shape' for blend shape deltas.
+
+        ufbx/Maya expect blend shape targets as separate Geometry objects with
+        sub_type 'Shape', containing Indexes (affected vertex indices) and
+        Vertices (delta positions, 3 floats per affected vertex).
+        """
+        oid = self.id_gen.new()
+        self._count("Geometry")
+        obj = _Node("Geometry", [("L", oid), ("S", f"Geometry::{name}"), ("S", "Shape")])
+        p70 = obj.add_child(_Node("Properties70"))
+        p70.add_child(_Node("P", [("S", "LegacyStyle"), ("S", "bool"), ("S", ""), ("S", ""), ("C", False)]))
+        obj.add_child(_Node("Version", [("I", 101)]))
+        obj.add_child(_Node("Indexes", [("i", indices)]))
+        flat_d: List[float] = []
+        for d in deltas:
+            flat_d.extend(d)
+        obj.add_child(_Node("Vertices", [("d", flat_d)]))
         self._objects.add_child(obj)
         return oid
 
@@ -779,6 +798,24 @@ class _FBXFile:
             pn = obj.add_child(_Node("PoseNode"))
             pn.add_child(_Node("Node", [("L", node_id)]))
             pn.add_child(_Node("Matrix", [("d", list(matrix))]))
+        self._objects.add_child(obj)
+        return oid
+
+    def add_node_attribute_bone(self, name: str) -> int:
+        """Create a NodeAttribute of type 'LimbNode' for a bone Model.
+
+        ufbx (UE5.8's FBX parser) detects bones via NodeAttribute nodes with
+        sub_type 'LimbNode' for FBX version 7000+. Without this, the bone
+        Model nodes are parsed as regular nodes but scene->bones.count == 0.
+        Connection format (per Maya reference): C("OO", attr_id, model_id)
+        i.e. NodeAttribute is the source, Model is the destination.
+        """
+        oid = self.id_gen.new()
+        self._count("NodeAttribute")
+        obj = _Node("NodeAttribute", [("L", oid), ("S", f"NodeAttribute::{name}"), ("S", "LimbNode")])
+        p70 = obj.add_child(_Node("Properties70"))
+        p70.add_child(_Node("P", [("S", "Size"), ("S", "double"), ("S", "Number"), ("S", ""), ("D", 1.0)]))
+        obj.add_child(_Node("TypeFlags", [("S", "Skeleton")]))
         self._objects.add_child(obj)
         return oid
 
@@ -1183,26 +1220,30 @@ def write_fbx(
     # ---- Bone Models ----
     # Emit in bone_infos order so parents precede children (synthetic root
     # is first, then PMX bones in their original order).
+    # For each bone, also create a NodeAttribute (LimbNode) and connect it
+    # to the bone Model via OO (attr->model). ufbx detects bones through
+    # NodeAttribute nodes, NOT from Model sub_type, for FBX 7000+.
     for info in bone_infos:
         info.fbx_model_id = fbx.add_model_bone(
             info.name,
             translation=info.local_translation,
         )
+        attr_id = fbx.add_node_attribute_bone(info.name)
+        # NodeAttribute -> Model (attr is src, model is dst, per Maya format)
+        fbx.connect_oo(attr_id, info.fbx_model_id)
 
     # Connect bone hierarchy (OO child -> parent)
     for info in bone_infos:
         if info.parent_fbx_index >= 0:
             parent_id = bone_infos[info.parent_fbx_index].fbx_model_id
             fbx.connect_oo(info.fbx_model_id, parent_id)
+        else:
+            # Top-level bone connects to scene root (0)
+            fbx.connect_oo(info.fbx_model_id, 0)
 
-    # If a synthetic root exists, connect the mesh to it; otherwise connect
-    # the mesh to the single PMX root bone.
-    if synth_root_idx >= 0:
-        fbx.connect_oo(mesh_model_id, bone_infos[synth_root_idx].fbx_model_id)
-    elif bone_infos:
-        # find the root (parent_fbx_index == -1)
-        root_id = next(b.fbx_model_id for b in bone_infos if b.parent_fbx_index < 0)
-        fbx.connect_oo(mesh_model_id, root_id)
+    # Mesh model connects to scene root (0), NOT to a bone.
+    # Skinning is handled via Skin/Cluster deformers, not node hierarchy.
+    fbx.connect_oo(mesh_model_id, 0)
 
     # ---- Geometry: vertices, faces, normals, UVs ----
     log(f"  geometry: {len(model.vertices)} verts, {len(model.faces)//3} tris")
@@ -1275,7 +1316,6 @@ def write_fbx(
         uv_indices,
         additional_uvs=additional_uvs,
         material_per_face=material_per_face if material_per_face else None,
-        shape_blocks=shape_blocks if shape_blocks else None,
     )
     # Connect geometry OO to mesh model
     fbx.connect_oo(geom_id, mesh_model_id)
@@ -1378,17 +1418,25 @@ def write_fbx(
                 transform,
                 info.transform_link,
             )
+            # Cluster -> Skin (OO)
             fbx.connect_oo(cid, skin_id)
-            fbx.connect_op(cid, info.fbx_model_id, "Link")
+            # Bone -> Cluster (OO, no property). ufbx expects bone as src,
+            # cluster as dst, plain OO connection (NOT OP "Link").
+            fbx.connect_oo(info.fbx_model_id, cid)
 
     # ---- Blend shapes (vertex morphs) ----
     if shape_blocks:
         log(f"  blend shapes: {len(shape_blocks)} channel(s)")
         bs_id = fbx.add_blendshape_deformer(mesh_name)
+        # BlendShape -> Geometry (OO)
         fbx.connect_oo(bs_id, geom_id)
-        for sb_name, _indices, _deltas in shape_blocks:
+        for sb_name, sb_indices, sb_deltas in shape_blocks:
             ch_id = fbx.add_blendshape_channel(sb_name)
+            # BlendShapeChannel -> BlendShape (OO)
             fbx.connect_oo(ch_id, bs_id)
+            # Shape geometry (target deltas) -> BlendShapeChannel (OO)
+            shape_id = fbx.add_shape_geometry(sb_name, sb_indices, sb_deltas)
+            fbx.connect_oo(shape_id, ch_id)
 
     # ---- Bind pose ----
     if options.emit_bind_pose:
