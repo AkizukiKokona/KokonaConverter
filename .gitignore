@@ -30,6 +30,7 @@ desktop.ini
 # Test / scratch output (do NOT ignore .fbx produced by users — only our scratch dir)
 /scratch/
 /tmp_out/
+/_test_data/
 
 # Logs
 *.log

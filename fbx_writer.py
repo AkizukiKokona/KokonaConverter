@@ -16,10 +16,10 @@ array, math, os). Produces FBX 7400 **binary** files with:
   - UV V-flip, triangle winding flip, scale factor
 
 Binary FBX format reference:
-  - Header: 27 bytes (magic + 0x1A00 + uint32 version)
+  - Header: 27 bytes (23-byte magic "Kaydara FBX Binary  \\x00\\x1a\\x00" + uint32 version)
   - Node records: EndOffset/NumProps/PropListLen/NameLen/Name/Props/Children/NULL
   - Properties: type char + data (Y/C/I/F/D/L/S/R and arrays i/l/f/d/b)
-  - Footer: 16 zero bytes + uint32(0) + uint32(version) + 4 zero bytes
+  - Footer: Footer1(16) + padding(0-15) + Footer2(4 zeros) + version(4) + Footer3(120 zeros) + Footer4(16 fixed)
 """
 
 from __future__ import annotations
@@ -808,18 +808,34 @@ class _FBXFile:
         # --- Serialize ---
         # The root node is a virtual container; its children are the top-level
         # FBX nodes. We serialize them sequentially with running offsets.
-        header = b"Kaydara FBX Binary\x00\x1a\x00" + struct.pack("<I", 7400)
+        # Magic is 23 bytes: "Kaydara FBX Binary" + TWO spaces + NUL + 0x1A + NUL
+        header = b"Kaydara FBX Binary  \x00\x1a\x00" + struct.pack("<I", 7400)
         body = bytearray()
-        offset = len(header)
+        offset = len(header)  # 27
         for child in self._root.children:
             cb = _serialize_node(child, offset)
             body.extend(cb)
             offset += len(cb)
-        # NULL record terminates the root
+        # NULL record terminates the root (13 bytes for FBX 7.4)
         body.extend(b"\x00" * 13)
 
-        # Footer: 16 zero bytes + uint32(0) + uint32(version) + 4 zero bytes
-        footer = b"\x00" * 16 + struct.pack("<II", 0, 7400) + b"\x00" * 4
+        # --- Footer (FBX 7.4 binary, total 160 + padding) ---
+        # Footer1: 16 bytes (can be zeros; parsers skip it)
+        # Padding: 0-15 bytes to align to 16-byte boundary
+        # Footer2: 4 bytes (all 0x00)
+        # Version: 4 bytes (same as header version)
+        # Footer3: 120 bytes (all 0x00)
+        # Footer4: 16 bytes (fixed magic: f85a8c6adef5d97eece90ce3758f290b)
+        pos_after_null = len(header) + len(body)
+        footer1 = b"\x00" * 16
+        pos_after_footer1 = pos_after_null + 16
+        padding_len = (16 - (pos_after_footer1 % 16)) % 16
+        padding = b"\x00" * padding_len
+        footer2 = b"\x00" * 4
+        version_field = struct.pack("<I", 7400)
+        footer3 = b"\x00" * 120
+        footer4 = bytes.fromhex("f85a8c6adef5d97eece90ce3758f290b")
+        footer = footer1 + padding + footer2 + version_field + footer3 + footer4
         return header + bytes(body) + footer
 
 
