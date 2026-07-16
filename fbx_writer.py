@@ -362,6 +362,7 @@ class _FBXFile:
         h = self._header_ext
         h.add_child(_Node("FBXHeaderVersion", [("I", 1003)]))
         h.add_child(_Node("FBXVersion", [("I", 7400)]))
+        h.add_child(_Node("EncryptionType", [("I", 0)]))
         ts = h.add_child(_Node("CreationTimeStamp"))
         ts.add_child(_Node("Version", [("I", 1000)]))
         ts.add_child(_Node("Year", [("I", 2026)]))

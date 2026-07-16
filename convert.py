@@ -52,6 +52,19 @@ def convert_pmx_to_fbx(
     out_dir = os.path.dirname(out_path)
     os.makedirs(out_dir, exist_ok=True)
 
+    # UE5.x Interchange FBX parser has a known issue with non-ASCII file paths
+    # on Windows (GetFullPathNameA / fopen fail with CJK characters).
+    # Warn the user so they can move the file to an ASCII-only path.
+    try:
+        out_path.encode("ascii")
+    except UnicodeEncodeError:
+        log("")
+        log("⚠ 警告: 输出路径包含非ASCII字符 (中文/日文等)")
+        log("  UE5.x Interchange FBX 解析器在 Windows 上可能无法打开此路径。")
+        log("  建议将 FBX 文件移动到纯英文路径后再导入 UE, 例如:")
+        log("  C:\\Models\\model.fbx")
+        log("")
+
     log(f"Reading PMX: {pmx_path}")
     model = read_pmx(pmx_path)
     log(
